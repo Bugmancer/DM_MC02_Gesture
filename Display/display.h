@@ -23,6 +23,12 @@ typedef struct {
     display_state_t state;
     uint8_t selected_slot;
     uint8_t slot_templates[8];
+    uint32_t slot_colors[8];
+    uint8_t settings_open;
+    uint8_t settings_row;
+    uint8_t class_limit;
+    uint8_t config_demos;
+    uint8_t config_slot;
     uint8_t learning_count;
     uint8_t learning_target;
     uint8_t power_ok;

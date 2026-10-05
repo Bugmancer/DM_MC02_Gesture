@@ -20,6 +20,14 @@ terminated, with 39 visible ASCII characters at most; lowercase is rendered as
 uppercase. `power_ok` means the application's power-enable state, not a measured
 supply voltage. Use the message for acquisition or storage error details.
 
+`class_limit` restricts the visible slots (1-8). `settings_open` selects the
+on-device configuration view; `settings_row` selects one of eight rows: action
+count, demonstrations, color slot, red, green, blue, save, cancel. The view
+uses `config_demos`, zero-based `config_slot`, and `slot_colors` in 0xRRGGBB.
+These fields display the application's working draft; Flash writes and cancel
+semantics belong to the application. Normal UP enters settings; it no longer
+toggles recognition.
+
 ## DMA And Timing
 
 - Place the `.dma_buffer` section in STM32H723 AXI SRAM, `0x24000000` through
@@ -51,7 +59,8 @@ gcc -std=c99 -Wall -Wextra -Werror -I Display/tests Display/tests/test_display.c
 & $env:TEMP\dm_gesture_display_test.exe
 ```
 
-The five transport tests cover first-frame/backlight completion, unchanged-view
+The six tests cover first-frame/backlight completion, unchanged-view
 suppression, view changes during DMA, timeout/start-failure behavior, and message
-termination. Target initialization, pixel appearance and real DMA interrupt
+termination, settings values, selection, active slot limits and text bounds.
+Target initialization, pixel appearance and real DMA interrupt
 timing require board validation.

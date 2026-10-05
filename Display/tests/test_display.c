@@ -188,6 +188,39 @@ static void test_unterminated_and_short_messages(void)
     assert(wanted[11].text[0] == '\0');
 }
 
+static void test_device_settings_and_active_slots_fit_panel(void)
+{
+    unsigned int row, selection;
+    reset_refresh();
+    current_view.class_limit = 3U;
+    current_view.config_demos = 2U;
+    current_view.config_slot = 2U;
+    current_view.slot_colors[2] = 0x12abffUL;
+    current_view.state = DISPLAY_STATE_ARMED;
+    compose_rows();
+    assert(strstr(wanted[2].text, "1/3") != NULL);
+    assert(strstr(wanted[3].text, "4:") == NULL);
+    assert(wanted[4].text[0] == '\0');
+    assert(strstr(wanted[13].text, "SETTINGS") != NULL);
+    current_view.settings_open = 1U;
+    (void)snprintf(current_view.message, sizeof(current_view.message), "Settings save failed. OK retries");
+    for (selection = 0U; selection < 8U; ++selection) {
+        current_view.settings_row = (uint8_t)selection;
+        compose_rows();
+        assert(wanted[selection + 3U].text[0] == '>');
+        for (row = 0U; row < LCD_ROWS; ++row) assert(strlen(wanted[row].text) <= TEXT_LENGTH);
+        assert(strstr(wanted[11].text, "12ABFF") != NULL);
+        assert(strstr(wanted[2].text, "save failed") != NULL);
+        assert(strstr(wanted[6].text, "18") != NULL);
+        assert(strstr(wanted[7].text, "171") != NULL);
+        assert(strstr(wanted[8].text, "255") != NULL);
+    }
+    current_view.settings_row = 255U;
+    current_view.config_slot = 255U;
+    compose_rows();
+    assert(wanted[3].text[0] == '>');
+}
+
 int main(void)
 {
     test_initial_frame_and_unchanged_view();
@@ -195,6 +228,7 @@ int main(void)
     test_timeout_stops_without_touching_spi();
     test_start_failure();
     test_unterminated_and_short_messages();
-    puts("Display transport tests passed (5 cases).");
+    test_device_settings_and_active_slots_fit_panel();
+    puts("Display transport and settings tests passed (6 cases).");
     return 0;
 }

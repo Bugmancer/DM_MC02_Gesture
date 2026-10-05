@@ -202,7 +202,8 @@ export class AirPenModel {
           completed: false,
           corrected: false,
         };
-        if (validStrokeId(sample.stroke_id)) stroke.sourceStrokeId = sample.stroke_id;
+        if (validStrokeId(sample.stroke_id))
+          stroke.sourceStrokeId = sample.stroke_id;
         if (state.pen_motion?.algorithm === TRAJECTORY_ALGORITHM) {
           stroke.algorithm = TRAJECTORY_ALGORITHM;
         }
@@ -233,14 +234,23 @@ export class AirPenModel {
     if (!Array.isArray(corrections)) return;
     for (const correction of corrections) {
       if (!validStrokeId(correction?.stroke_id)) continue;
-      const stroke = this.strokes.find((candidate) =>
-        candidate.frame === this.epoch &&
-        candidate.sourceStrokeId === correction.stroke_id &&
-        candidate.completed === true &&
-        candidate.corrected !== true,
+      const stroke = this.strokes.find(
+        (candidate) =>
+          candidate.frame === this.epoch &&
+          candidate.sourceStrokeId === correction.stroke_id &&
+          candidate.completed === true &&
+          candidate.corrected !== true,
       );
-      if (!stroke || !Array.isArray(correction.points) || !correction.points.length) continue;
-      if (this.pointCount - stroke.points.length + correction.points.length > MAX_POINTS) {
+      if (
+        !stroke ||
+        !Array.isArray(correction.points) ||
+        !correction.points.length
+      )
+        continue;
+      if (
+        this.pointCount - stroke.points.length + correction.points.length >
+        MAX_POINTS
+      ) {
         this.reason = "笔记已满，请导出后清空";
         continue;
       }
@@ -309,12 +319,15 @@ export class AirPenModel {
           s.width > 12 ||
           typeof s.frame !== "string" ||
           s.frame.length > 100 ||
-          (s.sourceStrokeId !== undefined && !validStrokeId(s.sourceStrokeId)) ||
+          (s.sourceStrokeId !== undefined &&
+            !validStrokeId(s.sourceStrokeId)) ||
           (s.completed !== undefined && typeof s.completed !== "boolean") ||
           (s.corrected !== undefined && typeof s.corrected !== "boolean") ||
           (s.corrected === true && s.completed !== true) ||
-          (s.algorithm !== undefined && (typeof s.algorithm !== "string" || s.algorithm.length > 80)) ||
-          (s.revision !== undefined && (!Number.isSafeInteger(s.revision) || s.revision < 0)) ||
+          (s.algorithm !== undefined &&
+            (typeof s.algorithm !== "string" || s.algorithm.length > 80)) ||
+          (s.revision !== undefined &&
+            (!Number.isSafeInteger(s.revision) || s.revision < 0)) ||
           !Array.isArray(s.points) ||
           !s.points.length ||
           !s.points.every(validPosition)

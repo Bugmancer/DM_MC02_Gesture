@@ -14,6 +14,7 @@ from backend import Controller
 STATUS = "STATUS,1000,1,2,1,10,0,0,0,0,420,90\n"
 FIRMWARE = "FIRMWARE,gesture-20261005-r3,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO\n"
 WARNING_FIRMWARE = "FIRMWARE,gesture-20261005-r4,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING\n"
+AUTO_FIRMWARE = "FIRMWARE,gesture-20261005-r7,KEY_CAPTURE,NO_CALIBRATION,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG\n"
 
 
 def until(predicate, timeout=2):
@@ -99,6 +100,105 @@ class ControllerTests(unittest.TestCase):
         self.serial.feed(STATUS)
         until(lambda: "t" in self.controller.snapshot()["status"])
 
+    def test_optional_windows_buffers_do_not_block_connection(self):
+        self.serial.set_buffer_size = mock.Mock(side_effect=OSError("unsupported driver"))
+        self.connect_real()
+        self.serial.set_buffer_size.assert_called_once_with(rx_size=65536, tx_size=4096)
+        state = self.controller.snapshot()
+        self.assertEqual(state["connection"]["state"], "connected")
+        self.assertTrue(any(event.get("detail") == "unsupported driver" for event in state["events"]))
+
+    def test_config_write_waits_for_board_ack_and_validates_full_transaction(self):
+        self.connect_real()
+        payload = {"class_limit": 2, "demo_target": 3, "colors": ["#123456"] * 8}
+        with self.assertRaisesRegex(ValueError, "r8"):
+            self.controller.configure_board(payload)
+        self.controller._process_line("FIRMWARE,gesture-20261006-r8,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG")
+        before = self.controller.snapshot()["config"].copy()
+        result = self.controller.configure_board(payload)
+        self.assertEqual(result["config"], before, "No optimistic success or color update")
+        self.assertEqual(result["config_write"]["state"], "pending")
+        until(lambda: any(data.startswith(b"configure 2 3 ") for data in self.serial.writes))
+        wire = next(data for data in self.serial.writes if data.startswith(b"configure "))
+        self.assertLess(len(wire), 80)
+        with self.assertRaises(ValueError):
+            self.controller.configure_board(payload)
+        self.controller._process_line("CONFIG,2,3")
+        self.controller._process_line("COLOR,1,123456")
+        self.controller._process_line("CONFIG_RESULT,SAVED")
+        result = self.controller.snapshot()
+        self.assertEqual(result["config_write"]["state"], "saved")
+        self.assertEqual(result["slots"][0]["color"], "#123456")
+        self.controller.configure_board(payload)
+        self.controller._process_line("CONFIG_RESULT,FAILED")
+        self.assertEqual(self.controller.snapshot()["config_write"]["state"], "failed")
+        for update in ({"class_limit": 9}, {"demo_target": 0}, {"colors": ["#xxxxxx"] * 8}, {"colors": []}):
+            with self.assertRaises(ValueError):
+                self.controller.configure_board({**payload, **update})
+
+    def test_demo_config_writes_change_live_state_and_disable_high_slots(self):
+        self.controller.connect(demo=True)
+        until(lambda: self.controller.snapshot()["protocol"]["inventory"])
+        self.controller.configure_board({"class_limit": 1, "demo_target": 2, "colors": ["#8040ff"] * 8})
+        result = until(lambda: self.controller.snapshot() if self.controller.snapshot()["config_write"]["state"] == "saved" else None)
+        self.assertEqual(result["config"]["class_limit"], 1)
+        self.assertEqual(result["training"]["required"], 2)
+        self.assertFalse(result["slots"][1]["enabled"])
+        self.assertEqual(result["slots"][0]["color"], "#8040ff")
+
+    def test_r7_config_colors_and_auto_state_do_not_change_host_keyboard_permission(self):
+        self.connect_real()
+        self.controller._process_line(AUTO_FIRMWARE)
+        self.controller._process_line("CONFIG,2,3")
+        self.controller._process_line("COLOR,1,18000A")
+        self.controller._process_line("SLOT,3,2,Preserved")
+        state = self.controller.snapshot()
+        self.assertEqual(state["config"], {"class_limit": 2, "demo_target": 3, "reported": True})
+        self.assertEqual(state["training"]["required"], 3, "CONFIG target overrides compatibility ONE_DEMO")
+        self.assertEqual(state["slots"][0]["color"], "#18000a")
+        self.assertTrue(state["slots"][1]["enabled"])
+        self.assertFalse(state["slots"][2]["enabled"])
+        self.assertEqual(state["slots"][2]["templates"], 2)
+        for command in ("arm", "disarm", "learn 3", "delete 3"):
+            with self.subTest(command=command), self.assertRaises(ValueError):
+                self.controller.command(command)
+        for line in ("STATE,ARMED", "SAVED,1,1024", "DELETED,2,1024"):
+            self.controller._process_line(line)
+            self.assertEqual(self.controller.snapshot()["status"]["armed"], 1)
+        self.assertFalse(self.controller.snapshot()["hotkeys_enabled"])
+
+    def test_r7_confirmed_rgb_holds_three_seconds_across_matches_and_unknowns(self):
+        self.connect_real()
+        self.controller._process_line(AUTO_FIRMWARE)
+        self.controller._process_line("EVENT,1100,1,100000,600000,400")
+        self.controller._process_line("MATCH,1120,2,110000,500000,200")
+        self.controller._process_line("UNKNOWN,1140,DISTANCE")
+        self.controller._last_confident_match -= 2.5
+        self.assertEqual(self.controller.snapshot()["recent_match"]["id"], 1)
+        self.controller._last_confident_match -= 0.6
+        self.assertIsNone(self.controller.snapshot()["recent_match"])
+        self.controller._process_line("EVENT,1200,2,100000,600000,400")
+        self.assertEqual(self.controller.snapshot()["recent_match"]["id"], 2)
+        self.assertEqual(self.keyboard.keys, [])
+
+    def test_pen_correction_cursor_filters_completed_geometry_for_each_client(self):
+        for seq, down in enumerate((0, 1, 1, 0, 1, 1, 0), start=1):
+            self.controller._process_line(f"RAW,{seq},{seq * 5},0,0,9807,0,0,0,{down}")
+        state = self.controller.snapshot()
+        self.assertEqual([item["stroke_id"] for item in state["pen_corrections"]], [1, 2])
+        self.assertEqual(state["pen_correction_cursor"], 2)
+        self.assertEqual([item["stroke_id"] for item in self.controller.snapshot(pen_after=1)["pen_corrections"]], [2])
+        for _ in range(4):
+            delta = self.controller.snapshot(pen_after=2)
+            self.assertEqual(delta["pen_corrections"], [])
+            self.assertEqual(delta["pen_correction_cursor"], 2)
+        state["pen_corrections"][0]["points"][0][0] = 999
+        self.assertNotEqual(self.controller.snapshot()["pen_corrections"][0]["points"][0][0], 999)
+        self.controller.reset_pose()
+        self.assertEqual(self.controller.snapshot()["pen_correction_cursor"], 0)
+        with self.assertRaises(ValueError):
+            self.controller.snapshot(pen_after=-1)
+
     def test_split_lines_inventory_and_shutdown_commands(self):
         self.connect_real()
         self.serial.feed("HELLO,DM_MC02_GES")
@@ -118,7 +218,8 @@ class ControllerTests(unittest.TestCase):
         until(lambda: b"learn 8\n" in self.serial.writes)
         self.controller.disconnect()
         self.assertTrue(self.serial.closed)
-        self.assertEqual(self.serial.writes[-2:], [b"disarm\n", b"stream 0\n"])
+        self.assertEqual(self.serial.writes[-1:], [b"stream 0\n"])
+        self.assertNotIn(b"disarm\n", self.serial.writes)
         self.assertTrue(self.serial.reset)
 
     def test_old_firmware_does_not_invent_empty_slots(self):
@@ -316,7 +417,7 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(state["training"]["state"], "idle")
             self.assertFalse(state["capture"]["active"])
             self.assertEqual(state["capture"]["reason"], "connection_lost")
-            self.assertEqual(replacement.writes, [b"stream 0\n", b"disarm\n", b"status\n", b"list\n"])
+            self.assertEqual(replacement.writes, [b"stream 0\n", b"status\n", b"list\n"])
             replacement.feed("STATUS,invalid\nEVENT,1200,1,100,900,720\n")
             until(lambda: self.controller.snapshot()["counters"]["events"] == 1)
             self.assertEqual(self.controller.snapshot()["connection"]["state"], "reconnecting")
@@ -390,9 +491,10 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             self.controller._recovery_port("COM_TEST", "USB VID:PID=0483:5740")
 
-    def test_demo_learning_requires_save_and_never_emits_hotkeys(self):
+    def test_demo_learning_auto_saves_at_target_and_restores_recognition(self):
         self.controller.connect(demo=True)
         until(lambda: self.controller.snapshot()["protocol"]["inventory"])
+        self.assertEqual(self.controller.snapshot()["status"]["armed"], 1)
         with self.assertRaises(ValueError):
             self.controller.set_hotkeys(True)
         self.controller.command("learn 3")
@@ -405,39 +507,34 @@ class ControllerTests(unittest.TestCase):
             with self.controller._lock:
                 self.controller._demo_key_started = time.monotonic() - 0.7
             self.controller.command("demo key 0")
-            until(lambda: self.controller.snapshot()["training"]["collected"] == count)
-            self.assertEqual(self.controller.snapshot()["training"]["state"], "ready")
-        snapshot = self.controller.snapshot()
-        self.assertEqual(snapshot["training"]["state"], "ready")
-        self.assertEqual(snapshot["slots"][2]["state"], "empty")
-        self.controller.command("save")
+            if count < 3:
+                until(lambda: self.controller.snapshot()["training"]["collected"] == count)
+                self.assertEqual(self.controller.snapshot()["training"]["state"], "recording")
+                self.assertEqual(self.controller.snapshot()["status"]["armed"], 0)
         until(lambda: self.controller.snapshot()["slots"][2]["state"] == "saved")
+        self.assertEqual(self.controller.snapshot()["status"]["armed"], 1)
+        self.assertEqual(self.controller.snapshot()["training"]["state"], "idle")
+        self.assertEqual(self.controller.snapshot()["slots"][2]["templates"], 3)
         self.assertTrue(self.controller.snapshot()["connection"]["simulation"])
         self.assertEqual(self.keyboard.keys, [])
 
-    def test_demo_one_recording_can_save_and_optional_hold_blocks_save(self):
+    def test_demo_configured_single_demonstration_auto_saves_after_release(self):
         self.controller.connect(demo=True)
         until(lambda: self.controller.snapshot()["protocol"]["inventory"])
+        self.controller._process_line("CONFIG,4,1")
         self.controller.command("learn 3")
         until(lambda: self.controller.snapshot()["training"]["state"] == "recording")
         self.controller.command("demo key 1")
         until(lambda: self.controller.snapshot()["training"]["capturing"])
         with self.controller._lock:
             self.controller._demo_key_started = time.monotonic() - 0.7
-        self.controller.command("demo key 0")
-        until(lambda: self.controller.snapshot()["training"]["state"] == "ready")
-        self.controller.command("demo key 1")
-        until(lambda: self.controller.snapshot()["training"]["capturing"])
         self.controller.command("save")
         until(lambda: self.controller.snapshot()["training"]["message"] == "SAVE, NOT_READY")
         self.assertEqual(self.controller.snapshot()["slots"][2]["state"], "empty")
-        with self.controller._lock:
-            self.controller._demo_key_started = time.monotonic()
         self.controller.command("demo key 0")
-        until(lambda: not self.controller.snapshot()["training"]["capturing"])
-        self.controller.command("save")
         until(lambda: self.controller.snapshot()["slots"][2]["state"] == "saved")
         self.assertEqual(self.controller.snapshot()["slots"][2]["templates"], 1)
+        self.assertEqual(self.controller.snapshot()["status"]["armed"], 1)
 
     def test_demo_rejects_overlong_hold_only_after_release(self):
         self.controller.connect(demo=True)

@@ -53,8 +53,8 @@ class LocalServer(ThreadingHTTPServer):
                 self._ui_signature = signature
             return {"ui_revision": self._ui_revision, "server_instance": self.server_instance}
 
-    def snapshot(self, after=0):
-        return {**self.controller.snapshot(after), **self.identity()}
+    def snapshot(self, after=0, pen_after=0):
+        return {**self.controller.snapshot(after, pen_after=pen_after), **self.identity()}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -105,7 +105,8 @@ class Handler(BaseHTTPRequestHandler):
                                         **self.server.identity()})
             if route.path == "/api/state":
                 after = int(query.get("after", ["0"])[0])
-                return self.reply(200, self.server.snapshot(max(0, after)))
+                pen_after = int(query.get("pen_after", ["0"])[0])
+                return self.reply(200, self.server.snapshot(max(0, after), pen_after=pen_after))
             if route.path == "/api/ports":
                 return self.reply(200, {"ports": self.server.controller.list_ports()})
             if route.path == "/api/captures":
@@ -171,6 +172,8 @@ class Handler(BaseHTTPRequestHandler):
                     controller.set_hotkeys(payload["hotkeys_enabled"])
                 else:
                     controller.save_slot(payload.get("slot"), payload.get("name", ""), payload.get("hotkey", ""))
+            elif route == "/api/board/config":
+                controller.configure_board(payload)
             elif route == "/api/capture/start":
                 controller.capture_start(payload)
             elif route == "/api/capture/stop":

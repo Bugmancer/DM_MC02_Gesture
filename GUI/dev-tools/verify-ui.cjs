@@ -49,12 +49,27 @@ async function api(route, payload) {
 }
 
 async function noPageOverflow(page) {
+  const overflow = await page.evaluate(() => ({
+    width: innerWidth,
+    scroll: document.documentElement.scrollWidth,
+    containers: [...document.querySelectorAll("html, body, .workspace, .table-scroll, .tabs, dialog, #toast")]
+      .map(element => ({tag: element.tagName, id: element.id, className: element.className,
+        width: element.getBoundingClientRect().width, right: element.getBoundingClientRect().right,
+        scroll: element.scrollWidth, overflow: getComputedStyle(element).overflow})),
+    elements: [...document.querySelectorAll("body *")]
+      .filter(element => (element.getBoundingClientRect().right > innerWidth + 1 ||
+        (element.scrollWidth > element.clientWidth + 1 && getComputedStyle(element).overflow === "visible")) &&
+        !element.closest(".table-scroll"))
+      .slice(0, 12).map(element => ({tag: element.tagName, id: element.id,
+        className: String(element.className), right: element.getBoundingClientRect().right,
+        client: element.clientWidth, scroll: element.scrollWidth})),
+  }));
   assert.equal(
     await page.evaluate(
       () => document.documentElement.scrollWidth <= innerWidth,
     ),
     true,
-    "Page exceeds viewport width",
+    `Page exceeds viewport width: ${JSON.stringify(overflow)}`,
   );
 }
 
@@ -350,11 +365,49 @@ function changedPixels(first, second) {
   );
   assert.ok(
     (await page.locator("#firmware-version").textContent()).includes(
-      "gesture-20261005-r5",
+      "gesture-20261006-r8",
     ),
   );
   assert.equal(await page.locator("#firmware-warning").isHidden(), true);
   assert.equal(await page.locator("#hotkeys-toggle").isDisabled(), true);
+  assert.equal(await page.locator("#armed-toggle").isDisabled(), true);
+  assert.equal(await page.locator("#armed-toggle").isChecked(), true);
+  await page.locator("#config-class-limit").selectOption("5");
+  await page.locator("#config-demo-target").selectOption("2");
+  await page.locator('[data-slot="1"] .slot-color-input').fill("#123456");
+  await delay(700);
+  assert.equal(await page.locator("#config-class-limit").inputValue(), "5");
+  assert.equal(await page.locator("#config-demo-target").inputValue(), "2");
+  assert.equal((await api("/api/state")).config.class_limit, 8,
+    "An unsaved draft must not change the board");
+  assert.equal(await page.locator("#config-save").isEnabled(), true);
+  await page.locator("#config-save").click();
+  await page.waitForFunction(() =>
+    document.querySelector("#config-save-status").textContent.includes("已保存"));
+  let configured = await api("/api/state");
+  assert.equal(configured.config.class_limit, 5);
+  assert.equal(configured.config.demo_target, 2);
+  assert.equal(configured.slots[0].color, "#123456");
+  assert.equal(configured.slots[0].state, "saved",
+    "Changing settings must preserve existing templates");
+  assert.equal(configured.status.armed, 1);
+  assert.equal(await page.locator("#slot-rows tr:visible").count(), 5);
+  assert.equal(await page.locator("#config-save").isDisabled(), true);
+  await page.screenshot({path: path.join(screenshots, "desktop-configured.png"), fullPage: true});
+  await page.setViewportSize({width: 390, height: 844});
+  await page.screenshot({path: path.join(screenshots, "mobile-configured.png"), fullPage: true});
+  await noPageOverflow(page);
+  await page.setViewportSize({width: 1440, height: 1000});
+  await page.locator("#config-class-limit").selectOption("8");
+  await page.locator("#config-demo-target").selectOption("3");
+  await page.locator("#config-save").click();
+  await page.waitForFunction(() =>
+    document.querySelector("#slot-rows tr[data-slot='8']").hidden === false &&
+    document.querySelector("#config-save").disabled);
+  configured = await api("/api/state");
+  assert.equal(configured.config.class_limit, 8);
+  assert.equal(configured.config.demo_target, 3);
+  assert.equal(configured.slots[0].color, "#123456");
   const third = page.locator('#slot-rows tr[data-slot="3"]');
   await third.locator(".name-input").click();
   await third.locator(".name-input").fill("Circle test");
@@ -418,35 +471,30 @@ function changedPixels(first, second) {
         Number(document.querySelector("#training-count").textContent) === value,
       count,
     );
-    await page.waitForFunction(
-      () => !document.querySelector("#save-button").disabled,
-    );
     if (count < 3) {
+      assert.equal(await page.locator("#save-button").isDisabled(), true);
       assert.equal(
         await page.locator("#demo-key-button").isDisabled(),
         false,
-        "Extra demonstrations must remain optional after the first",
+        "The configured target still needs another demonstration",
       );
     }
   }
-  await page.waitForFunction(
-    () => !document.querySelector("#save-button").disabled,
-  );
-  assert.equal(
-    (await api("/api/state")).slots[2].state,
-    "empty",
-    "Training requires explicit save",
-  );
-  await page.screenshot({
-    path: path.join(screenshots, "desktop-ready.png"),
-    fullPage: true,
-  });
-  await page.locator("#save-button").click();
   await page.waitForFunction(() =>
     document
       .querySelector('#slot-rows tr[data-slot="3"] .slot-state-text')
       .textContent.includes("已保存"),
   );
+  assert.equal(
+    (await api("/api/state")).slots[2].state,
+    "saved",
+    "The third configured demonstration must automatically save",
+  );
+  await page.screenshot({
+    path: path.join(screenshots, "desktop-ready.png"),
+    fullPage: true,
+  });
+  assert.equal((await api("/api/state")).status.armed, 1);
   await page.locator('#slot-rows tr[data-slot="4"] .learn-slot').click();
   await page.waitForFunction(
     () => !document.querySelector("#demo-key-button").disabled,
@@ -465,18 +513,16 @@ function changedPixels(first, second) {
   await page.waitForFunction(
     () =>
       document.querySelector("#training-count").textContent === "1" &&
-      !document.querySelector("#save-button").disabled,
-  );
-  await page.locator("#save-button").click();
-  await page.waitForFunction(() =>
-    document
-      .querySelector('#slot-rows tr[data-slot="4"] .slot-state-text')
-      .textContent.includes("已保存"),
+      document.querySelector("#save-button").disabled,
   );
   assert.equal(
-    (await api("/api/state")).slots[3].templates,
-    1,
-    "One real demonstration must save as one template, not three copies",
+    (await api("/api/state")).slots[3].state,
+    "empty",
+    "A partial three-demonstration session must not auto-save early",
+  );
+  await page.locator("#cancel-button").click();
+  await page.waitForFunction(
+    () => document.querySelector("#armed-toggle").checked,
   );
   await page.locator('#slot-rows tr[data-slot="5"] .learn-slot').click();
   await page.waitForFunction(
@@ -505,7 +551,7 @@ function changedPixels(first, second) {
       .querySelector('#slot-rows tr[data-slot="3"] .slot-state-text')
       .textContent.includes("空槽位"),
   );
-  await page.locator("#armed-toggle").click();
+  assert.equal(await page.locator("#armed-toggle").isDisabled(), true);
   await page.waitForFunction(
     () => document.querySelector("#armed-toggle").checked,
   );
@@ -686,6 +732,11 @@ function changedPixels(first, second) {
     fullPage: true,
   });
   const warningState = await api("/api/state");
+  warningState.config = { class_limit: 5, demo_target: 1, reported: true };
+  warningState.slots.forEach((slot) => {
+    slot.enabled = slot.id <= 5;
+  });
+  warningState.slots[0].color = "#18000a";
   warningState.status.armed = 0;
   warningState.training = {
     state: "ready",
@@ -711,6 +762,15 @@ function changedPixels(first, second) {
   );
   assert.equal(await page.locator("#training-count").textContent(), "1");
   assert.equal(await page.locator("#save-button").isDisabled(), false);
+  assert.equal(await page.locator("#slot-rows tr:visible").count(), 5);
+  assert.equal(await page.locator(".sample-step:visible").count(), 1);
+  assert.equal(await page.locator("#slot-limit-badge").textContent(), "5");
+  assert.equal(
+    await page
+      .locator('#slot-rows tr[data-slot="1"] .color-swatch')
+      .evaluate((element) => getComputedStyle(element).backgroundColor),
+    "rgb(24, 0, 10)",
+  );
   await noPageOverflow(page);
   await page.screenshot({
     path: path.join(screenshots, "mobile-similarity-warning.png"),

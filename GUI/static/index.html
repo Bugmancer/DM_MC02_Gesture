@@ -51,7 +51,9 @@
         板端控制
       </div>
       <div class="switch-line" id="armed-control">
-        <span><i data-lucide="scan-line"></i>动作识别</span
+        <span
+          ><i data-lucide="scan-line"></i
+          ><span id="armed-label">动作识别</span></span
         ><label class="switch"
           ><input
             id="armed-toggle"
@@ -171,7 +173,9 @@
       </div>
       <nav class="tabs" aria-label="工作台视图">
         <button class="tab active" data-tab="library" aria-selected="true">
-          <i data-lucide="layers-3"></i>动作库<span>8</span>
+          <i data-lucide="layers-3"></i>动作库<span id="slot-limit-badge"
+            >8</span
+          >
         </button>
         <button class="tab" data-tab="live" aria-selected="false">
           <i data-lucide="activity"></i>实时数据
@@ -194,12 +198,24 @@
               <h2>动作槽位</h2>
               <span id="library-note" class="muted">等待设备同步</span>
             </div>
+            <div class="device-config" aria-label="板端动作配置">
+              <label>动作数量<select id="config-class-limit" aria-label="动作数量">
+                <option>1</option><option>2</option><option>3</option><option>4</option>
+                <option>5</option><option>6</option><option>7</option><option selected>8</option>
+              </select></label>
+              <label>示范次数<select id="config-demo-target" aria-label="每个动作的示范次数">
+                <option>1</option><option>2</option><option selected>3</option>
+              </select></label>
+              <button id="config-save" class="button secondary" disabled><i data-lucide="save"></i>保存到板子</button>
+              <span id="config-save-status" class="muted" role="status">等待设备同步</span>
+            </div>
             <div class="table-scroll">
               <table class="slot-table">
                 <thead>
                   <tr>
                     <th class="slot-number">槽位</th>
                     <th>动作名称</th>
+                    <th>RGB 灯色</th>
                     <th>示范 / 状态</th>
                     <th>电脑快捷键</th>
                     <th class="actions-heading">操作</th>
@@ -265,7 +281,8 @@
             </button>
             <div class="training-actions">
               <button id="save-button" class="button primary" disabled>
-                <i data-lucide="save"></i>保存动作</button
+                <i data-lucide="save"></i
+                ><span id="save-label">保存动作</span></button
               ><button id="cancel-button" class="button secondary" disabled>
                 <i data-lucide="x"></i>取消
               </button>

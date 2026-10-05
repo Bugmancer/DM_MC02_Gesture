@@ -1108,6 +1108,65 @@ static void test_live_prehistory_and_full_capacity(void)
     assert(recognized == 0u && unknown == 1u && matched == 0u);
 }
 
+static void test_class_limit_preserves_hidden_slots(void)
+{
+    size_t length;
+    ge_event_t event;
+    ge_init(&imported);
+    idle(&imported, 600u, 0);
+    enroll(&imported, 7u, "HIDDEN", 0);
+    length = ge_model_export(&imported, blob, sizeof(blob));
+    assert(ge_set_class_limit(&imported, 0u) == GE_ERR_ARGUMENT);
+    assert(ge_set_class_limit(&imported, 9u) == GE_ERR_ARGUMENT);
+    assert(ge_set_class_limit(NULL, 1u) == GE_ERR_ARGUMENT);
+    assert(imported.class_limit == 8u);
+    assert(ge_set_class_limit(&imported, 1u) == GE_OK);
+    assert(ge_class_count(&imported) == 1u && ge_active_class_count(&imported) == 0u);
+    assert(ge_class_get(&imported, 7u));
+    assert(ge_model_export(&imported, snapshot, sizeof(snapshot)) == length);
+    assert(!memcmp(blob, snapshot, length));
+    assert(ge_train_begin_at(&imported, 7u, "HIDDEN") == GE_ERR_ARGUMENT);
+    idle(&imported, 600u, 0);
+    clear_events();
+    motion(&imported, 0, 700u, 1.0f, 0);
+    assert(recognized == 0u && matched == 0u);
+    assert(ge_set_class_limit(&imported, 8u) == GE_OK);
+    idle(&imported, 600u, 0);
+    clear_events();
+    motion(&imported, 0, 700u, 1.0f, 0);
+    assert(recognized == 1u && last_class == 7u);
+    assert(ge_set_class_limit(&imported, 1u) == GE_OK);
+    assert(ge_train_begin(&imported, "BUSY") == GE_OK);
+    assert(ge_set_class_limit(&imported, 8u) == GE_ERR_BUSY);
+    assert(imported.class_limit == 1u && imported.training);
+    ge_train_cancel(&imported);
+    clear_events();
+    enroll(&imported, 0u, "SAME_VISIBLE", 0);
+    assert(accepted == 3u && rejected == 0u && warned == 0u);
+    assert(ge_class_count(&imported) == 2u && ge_active_class_count(&imported) == 1u);
+    assert(ge_train_begin(&imported, "FULL") == GE_ERR_FULL);
+    assert(ge_class_get(&imported, 7u));
+
+    /* Streaming must obey the same mask, including candidates already queued. */
+    assert(ge_model_import(&imported, blob, length) == GE_OK);
+    ge_set_streaming_recognition(&imported, 1);
+    assert(ge_set_class_limit(&imported, 1u) == GE_OK);
+    clear_events();
+    motion(&imported, 0, 750u, 1.0f, 0);
+    assert(recognized == 0u && matched == 0u);
+    assert(ge_set_class_limit(&imported, 8u) == GE_OK);
+    clear_events();
+    motion(&imported, 0, 750u, 1.0f, 0);
+    assert(recognized == 1u && last_class == 7u && matched > 0u);
+    imported.events[0].type = GE_EVENT_RECOGNIZED;
+    imported.events[0].class_id = 7u;
+    imported.event_read = 0u;
+    imported.event_write = imported.event_count = 1u;
+    assert(ge_set_class_limit(&imported, 1u) == GE_OK);
+    assert(!ge_next_event(&imported, &event));
+    puts("Class limits preserve stored slots and mask learning, warnings and both matchers.");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1128,6 +1187,7 @@ int main(void)
     test_live_matching();
     test_live_twenty_minute_stream();
     test_live_prehistory_and_full_capacity();
+    test_class_limit_preserves_hidden_slots();
     puts("All gesture engine tests passed.");
     return 0;
 }

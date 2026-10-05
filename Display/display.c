@@ -93,13 +93,45 @@ static uint32_t capped_count(uint32_t count)
     return count > 99999999UL ? 99999999UL : count;
 }
 
+static void compose_settings(void)
+{
+    uint8_t slot = current_view.config_slot < 8U ? current_view.config_slot : 0U;
+    uint8_t selected_row = current_view.settings_row < 8U ? current_view.settings_row : 0U;
+    uint32_t color = current_view.slot_colors[slot] & 0xffffffUL;
+    uint8_t i;
+    (void)snprintf(wanted[1].text, sizeof(wanted[1].text), "DEVICE SETTINGS");
+    wanted[1].foreground = COLOR_CYAN;
+    (void)snprintf(wanted[2].text, sizeof(wanted[2].text), "%.*s", (int)TEXT_LENGTH, current_view.message);
+    wanted[2].foreground = COLOR_YELLOW;
+    (void)snprintf(wanted[3].text, sizeof(wanted[3].text), "  ACTION COUNT       %u / 8", (unsigned)current_view.class_limit);
+    (void)snprintf(wanted[4].text, sizeof(wanted[4].text), "  DEMOS PER ACTION   %u / 3", (unsigned)current_view.config_demos);
+    (void)snprintf(wanted[5].text, sizeof(wanted[5].text), "  COLOR FOR ACTION   %u", (unsigned)slot + 1U);
+    (void)snprintf(wanted[6].text, sizeof(wanted[6].text), "  RED                %3u", (unsigned)((color >> 16) & 255U));
+    (void)snprintf(wanted[7].text, sizeof(wanted[7].text), "  GREEN              %3u", (unsigned)((color >> 8) & 255U));
+    (void)snprintf(wanted[8].text, sizeof(wanted[8].text), "  BLUE               %3u", (unsigned)(color & 255U));
+    (void)snprintf(wanted[9].text, sizeof(wanted[9].text), "  SAVE AND EXIT");
+    (void)snprintf(wanted[10].text, sizeof(wanted[10].text), "  CANCEL");
+    for (i = 3U; i <= 10U; ++i) wanted[i].foreground = COLOR_MUTED;
+    wanted[3U + selected_row].text[0] = '>';
+    wanted[3U + selected_row].foreground = COLOR_YELLOW;
+    (void)snprintf(wanted[11].text, sizeof(wanted[11].text), "RGB #%06lX", (unsigned long)color);
+    (void)snprintf(wanted[12].text, sizeof(wanted[12].text), "UP/DOWN SELECT   < > CHANGE");
+    (void)snprintf(wanted[13].text, sizeof(wanted[13].text), "%s",
+                   selected_row >= 3U && selected_row <= 5U ? "OK +1   < > +/-17" : "OK SELECT");
+    if (strlen(current_view.message) > TEXT_LENGTH)
+        (void)snprintf(wanted[14].text, sizeof(wanted[14].text), "%s", current_view.message + TEXT_LENGTH);
+    wanted[14].foreground = COLOR_YELLOW;
+    wanted[12].foreground = wanted[13].foreground = COLOR_MUTED;
+}
+
 static void compose_rows(void)
 {
     static const char * const state_names[] = {
-        "IDLE", "ARMED", "LEARNING", "READY", "SAVING", "UNKNOWN",
+        "IDLE", "AUTO", "LEARNING", "READY", "SAVING", "UNKNOWN",
         "MATCH", "CONFIRM", "ERROR"
     };
     uint8_t slot = current_view.selected_slot < 8U ? current_view.selected_slot : 0U;
+    uint8_t class_limit = current_view.class_limit >= 1U && current_view.class_limit <= 8U ? current_view.class_limit : 8U;
     uint8_t state = (uint8_t)current_view.state;
     char best[12], second[12];
     size_t message_size = strlen(current_view.message);
@@ -110,6 +142,10 @@ static void compose_rows(void)
     }
     wanted[0].foreground = COLOR_CYAN;
     (void)snprintf(wanted[0].text, sizeof(wanted[0].text), "DM-MC02 GESTURE");
+    if (current_view.settings_open) {
+        compose_settings();
+        return;
+    }
     if (state > DISPLAY_STATE_ERROR) {
         state = DISPLAY_STATE_ERROR;
     }
@@ -118,9 +154,9 @@ static void compose_rows(void)
                            state == DISPLAY_STATE_UNKNOWN ? COLOR_YELLOW :
                            state == DISPLAY_STATE_ARMED || state == DISPLAY_STATE_MATCH ?
                            COLOR_GREEN : COLOR_CYAN;
-    (void)snprintf(wanted[2].text, sizeof(wanted[2].text), "SELECT: %u    TEMPLATES: %u",
-                   (unsigned int)slot + 1U, (unsigned int)current_view.slot_templates[slot]);
-    for (i = 0U; i < 8U; ++i) {
+    (void)snprintf(wanted[2].text, sizeof(wanted[2].text), "ACTION: %u/%u    TEMPLATES: %u",
+                   (unsigned int)slot + 1U, (unsigned int)class_limit, (unsigned int)current_view.slot_templates[slot]);
+    for (i = 0U; i < class_limit; ++i) {
         uint8_t row = (uint8_t)(3U + i / 4U);
         size_t used = strlen(wanted[row].text);
         (void)snprintf(wanted[row].text + used, sizeof(wanted[row].text) - used,
@@ -158,10 +194,10 @@ static void compose_rows(void)
     wanted[11].foreground = COLOR_YELLOW;
     (void)snprintf(wanted[12].text, sizeof(wanted[12].text), "%s",
                    state == DISPLAY_STATE_CONFIRM ? "OK CONFIRM DELETE" :
-                   state == DISPLAY_STATE_READY ? "OK SAVE ACTION" :
-                   state == DISPLAY_STATE_LEARNING ? "OK SAVE WHEN READY" :
+                   state == DISPLAY_STATE_READY ? "OK RETRY SAVE" :
+                   state == DISPLAY_STATE_LEARNING ? "HOLD KEY TO RECORD" :
                    current_view.slot_templates[slot] != 0U ? "OK DELETE ACTION" : "OK LEARN ACTION");
-    (void)snprintf(wanted[13].text, sizeof(wanted[13].text), "< > SELECT   UP ARM / DISARM");
+    (void)snprintf(wanted[13].text, sizeof(wanted[13].text), "< > SELECT   UP SETTINGS");
     (void)snprintf(wanted[14].text, sizeof(wanted[14].text), "DOWN CANCEL");
     wanted[12].foreground = COLOR_MUTED;
     wanted[13].foreground = COLOR_MUTED;

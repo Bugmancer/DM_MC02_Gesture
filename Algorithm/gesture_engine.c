@@ -100,6 +100,7 @@ void ge_init(ge_engine_t *e)
     if (!e) return;
     memset(e, 0, sizeof(*e));
     e->recognizing = 1u;
+    e->class_limit = GE_MAX_CLASSES;
     reset_stream_match(e);
 }
 
@@ -125,6 +126,18 @@ void ge_set_manual_training(ge_engine_t *e, int enabled)
     if (!e || e->manual_training == manual) return;
     reset_capture(e, e->last_ms);
     e->manual_training = manual;
+}
+
+ge_status_t ge_set_class_limit(ge_engine_t *e, uint8_t limit)
+{
+    if (!e || limit == 0u || limit > GE_MAX_CLASSES) return GE_ERR_ARGUMENT;
+    if (e->class_limit == limit) return GE_OK;
+    if (e->training) return GE_ERR_BUSY;
+    e->class_limit = limit;
+    reset_capture(e, e->last_ms);
+    reset_stream_match(e);
+    e->event_count = e->event_read = e->event_write = 0u;
+    return GE_OK;
 }
 
 void ge_reset_stream(ge_engine_t *e)
@@ -153,6 +166,14 @@ uint8_t ge_class_count(const ge_engine_t *e)
     return count;
 }
 
+uint8_t ge_active_class_count(const ge_engine_t *e)
+{
+    uint8_t i, count = 0u;
+    if (!e) return 0u;
+    for (i = 0u; i < e->class_limit; ++i) count += e->model.classes[i].used ? 1u : 0u;
+    return count;
+}
+
 const ge_class_t *ge_class_get(const ge_engine_t *e, uint8_t id)
 {
     if (!e || id >= GE_MAX_CLASSES || !e->model.classes[id].used) return NULL;
@@ -174,17 +195,17 @@ ge_status_t ge_train_begin(ge_engine_t *e, const char *name)
 {
     uint8_t id;
     if (!e) return GE_ERR_ARGUMENT;
-    for (id = 0u; id < GE_MAX_CLASSES && e->model.classes[id].used; ++id) {}
-    if (id == GE_MAX_CLASSES) return GE_ERR_FULL;
+    for (id = 0u; id < e->class_limit && e->model.classes[id].used; ++id) {}
+    if (id == e->class_limit) return GE_ERR_FULL;
     return ge_train_begin_at(e, id, name);
 }
 
 ge_status_t ge_train_begin_at(ge_engine_t *e, uint8_t id, const char *name)
 {
     size_t n;
-    if (!e || !name || id >= GE_MAX_CLASSES) return GE_ERR_ARGUMENT;
+    if (!e || !name || id >= e->class_limit) return GE_ERR_ARGUMENT;
     if (e->training || e->capturing) return GE_ERR_BUSY;
-    if (ge_class_count(e) >= GE_MAX_CLASSES) return GE_ERR_FULL;
+    if (ge_active_class_count(e) >= e->class_limit) return GE_ERR_FULL;
     if (e->model.classes[id].used) return GE_ERR_CONFLICT;
     for (n = 0u; n < GE_NAME_BYTES && name[n]; ++n) {
         if ((unsigned char)name[n] < 32u || (unsigned char)name[n] > 126u) return GE_ERR_ARGUMENT;
@@ -238,7 +259,7 @@ ge_status_t ge_train_confirm(ge_engine_t *e, uint8_t *class_id)
     if (!e) return GE_ERR_ARGUMENT;
     if (!e->training || !e->pending_ready || e->capturing) return GE_ERR_NOT_READY;
     id = e->pending_class_id;
-    if (id >= GE_MAX_CLASSES || e->model.classes[id].used) return GE_ERR_CONFLICT;
+    if (id >= e->class_limit || e->model.classes[id].used) return GE_ERR_CONFLICT;
     c = &e->model.classes[id];
     memset(c, 0, sizeof(*c));
     c->used = 1u;
@@ -343,7 +364,7 @@ static void learn_segment(ge_engine_t *e, const ge_template_t *sample)
         if (e->manual_training) threshold = GE_MAX_THRESHOLD;
         else status = GE_ERR_INCONSISTENT;
     }
-    for (i = 0u; i < GE_MAX_CLASSES && status == GE_OK; ++i) {
+    for (i = 0u; i < e->class_limit && status == GE_OK; ++i) {
         const ge_class_t *c = &e->model.classes[i];
         if (!c->used) continue;
         /* This broad boundary is advisory for explicit manual enrollment.
@@ -383,7 +404,7 @@ static void recognize_segment(ge_engine_t *e, const ge_template_t *sample)
 {
     uint8_t i, id = GE_CLASS_NONE;
     float best = FLT_MAX, second = FLT_MAX;
-    for (i = 0u; i < GE_MAX_CLASSES; ++i) {
+    for (i = 0u; i < e->class_limit; ++i) {
         float d;
         if (!e->model.classes[i].used) continue;
         d = class_distance(e, sample, &e->model.classes[i]);
@@ -458,7 +479,7 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
     uint16_t count;
     uint8_t i, id;
     uint32_t duration = 0u;
-    if (!e->recognizing || !ge_class_count(e)) return;
+    if (!e->recognizing || !ge_active_class_count(e)) return;
     memcpy(e->stream_samples[e->stream_head], feature, sizeof(e->stream_samples[0]));
     e->stream_head = (uint16_t)((e->stream_head + 1u) % GE_STREAM_SAMPLES);
     if (e->stream_count < GE_STREAM_SAMPLES - GE_STREAM_RESERVE) ++e->stream_count;
@@ -493,9 +514,9 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
         e->stream_id = GE_CLASS_NONE;
         e->stream_cycle = 1u;
     }
-    while (e->stream_class < GE_MAX_CLASSES && !e->model.classes[e->stream_class].used)
+    while (e->stream_class < e->class_limit && !e->model.classes[e->stream_class].used)
         ++e->stream_class;
-    if (e->stream_class < GE_MAX_CLASSES) {
+    if (e->stream_class < e->class_limit) {
         c = &e->model.classes[e->stream_class];
         for (i = 0u; i < c->template_count; ++i) duration += c->templates[i].duration_ms;
         duration /= c->template_count;
@@ -518,9 +539,9 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
         e->stream_class_best = FLT_MAX;
         e->stream_scale = 0u;
         ++e->stream_class;
-        while (e->stream_class < GE_MAX_CLASSES && !e->model.classes[e->stream_class].used)
+        while (e->stream_class < e->class_limit && !e->model.classes[e->stream_class].used)
             ++e->stream_class;
-        if (e->stream_class < GE_MAX_CLASSES) return;
+        if (e->stream_class < e->class_limit) return;
     }
     e->stream_cycle = 0u;
     id = e->stream_id;

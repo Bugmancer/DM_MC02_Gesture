@@ -43,6 +43,18 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+def configure_serial_buffers(connection):
+    """Allow the bounded stroke smoother to run without exhausting Windows RX."""
+    configure = getattr(connection, "set_buffer_size", None)
+    if not callable(configure):
+        return None
+    try:
+        configure(rx_size=65536, tx_size=4096)
+    except Exception as error:
+        return str(error)
+    return None
+
+
 def integer(value, minimum=0, maximum=UINT32_MAX):
     if not re.fullmatch(r"-?[0-9]+", value):
         raise ValueError(f"invalid integer: {value!r}")
@@ -88,6 +100,14 @@ def parse_line(line):
         if len(fields) < 3 or not fields[2]:
             raise ValueError("UNKNOWN requires timestamp and reason")
         record.update(t=integer(fields[1]), reason=",".join(fields[2:]))
+    elif kind == "CONFIG":
+        if len(fields) != 3:
+            raise ValueError("CONFIG requires class limit and demonstration target")
+        record.update(class_limit=integer(fields[1], 1, 8), demo_target=integer(fields[2], 1, 3))
+    elif kind == "COLOR":
+        if len(fields) != 3 or not re.fullmatch(r"[0-9a-fA-F]{6}", fields[2]):
+            raise ValueError("COLOR requires slot and six-digit RGB hex")
+        record.update(id=integer(fields[1], 1, 8), color="#" + fields[2].lower())
     else:
         record["fields"] = fields[1:]
     return record
@@ -120,7 +140,7 @@ class LineFramer:
 
 
 def validate_command(command):
-    if command in {"status", "arm", "disarm", "cancel", "save", "calibrate", "stream 0", "stream 1"}:
+    if command in {"list", "status", "arm", "disarm", "cancel", "save", "calibrate", "stream 0", "stream 1"}:
         return command
     if re.fullmatch(r"(?:learn|delete) [1-8]", command):
         return command
@@ -262,7 +282,9 @@ def build_parser():
     parser.add_argument("--duration", type=positive_duration, help="capture for this many seconds")
     parser.add_argument("--command", action="append", type=validate_command, default=[], help="startup board command; repeatable")
     parser.add_argument("--hotkeys", type=Path, help="explicitly enable Windows keyboard events from this JSON map")
-    parser.add_argument("--keep-armed", action="store_true", help="omit the default disarm command when exiting")
+    exit_mode = parser.add_mutually_exclusive_group()
+    exit_mode.add_argument("--keep-armed", action="store_true", help="compatibility option; recognition is left running by default")
+    exit_mode.add_argument("--disarm-on-exit", action="store_true", help="explicitly send disarm when exiting (legacy firmware only)")
     parser.add_argument("--print-hotkey-example", action="store_true")
     return parser
 
@@ -290,6 +312,9 @@ def capture(args, serial_module, mapping, keyboard):
             writer.writeheader()
             try:
                 connection = serial_module.Serial(args.port, baudrate=115200, timeout=0.2, write_timeout=1)
+                buffer_error = configure_serial_buffers(connection)
+                if buffer_error:
+                    print(f"Serial buffer sizing unavailable: {buffer_error}", file=sys.stderr)
 
                 def command(text):
                     data = (text + "\n").encode("ascii")
@@ -297,8 +322,10 @@ def capture(args, serial_module, mapping, keyboard):
                         raise OSError("incomplete serial command write")
 
                 connection.reset_input_buffer()
-                command("stream 1")
+                command("stream 0")
                 command("status")
+                command("list")
+                command("stream 1")
                 for text in args.command:
                     command(text)
                 print(f"Recording to {output}; keyboard mapping {'enabled' if mapping else 'disabled'}", flush=True)
@@ -337,7 +364,7 @@ def capture(args, serial_module, mapping, keyboard):
                 print(f"Stopped: {error}; automatic reconnect is disabled.", file=sys.stderr)
             finally:
                 if connection is not None:
-                    for text in (["stream 0"] if args.keep_armed else ["stream 0", "disarm"]):
+                    for text in (["stream 0", "disarm"] if args.disarm_on_exit else ["stream 0"]):
                         try:
                             command(text)
                             exit_commands_sent.append(text)

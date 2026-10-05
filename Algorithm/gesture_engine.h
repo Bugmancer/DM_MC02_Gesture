@@ -88,7 +88,7 @@ typedef struct {
     uint16_t sample_count, pre_count, pre_head, strong_samples;
     uint8_t initialized, recognizing, capturing, training;
     uint8_t training_count, pending_ready, start_count, pending_class_id;
-    uint8_t armed, manual_training;
+    uint8_t armed, manual_training, class_limit;
     float pending_threshold;
     ge_event_t events[4];
     uint8_t event_read, event_write, event_count;
@@ -109,6 +109,9 @@ void ge_set_streaming_recognition(ge_engine_t *engine, int enabled);
 /* Default is automatic. Changing this setting discards an in-flight segment;
  * manual input changes learning only, never recognition segmentation. */
 void ge_set_manual_training(ge_engine_t *engine, int enabled);
+/* Enable slots [0, limit), retaining all saved classes. Changing the limit
+ * clears in-flight recognition and queued events. Training returns BUSY. */
+ge_status_t ge_set_class_limit(ge_engine_t *engine, uint8_t limit);
 void ge_feed(ge_engine_t *engine, const ge_sample_t *sample);
 int ge_next_event(ge_engine_t *engine, ge_event_t *event);
 
@@ -133,6 +136,7 @@ uint8_t ge_training_progress(const ge_engine_t *engine);
 int ge_training_ready(const ge_engine_t *engine);
 ge_status_t ge_training_error(const ge_engine_t *engine);
 uint8_t ge_class_count(const ge_engine_t *engine);
+uint8_t ge_active_class_count(const ge_engine_t *engine);
 const ge_class_t *ge_class_get(const ge_engine_t *engine, uint8_t class_id);
 ge_status_t ge_class_delete(ge_engine_t *engine, uint8_t class_id);
 

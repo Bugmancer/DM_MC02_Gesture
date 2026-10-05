@@ -18,10 +18,11 @@ function Invoke-CTest([string]$Name, [string[]]$Includes, [string[]]$Sources) {
     if ($LASTEXITCODE -ne 0) { throw "$Name tests failed." }
 }
 Invoke-CTest 'engine' @('Algorithm') @('Algorithm/gesture_engine.c','Tests/test_gesture_engine.c')
+Invoke-CTest 'config' @('App','Algorithm') @('App/gesture_config.c','Algorithm/gesture_engine.c','Tests/test_gesture_config.c')
 Invoke-CTest 'store' @('Tests/board_mock','Board') @('Board/board_store.c','Tests/board_store_test.c')
 Invoke-CTest 'display' @('Display/tests') @('Display/tests/test_display.c')
 Invoke-CTest 'keys' @('Tests/key_mock','Board') @('Tests/test_gesture_keys.c')
-Invoke-CTest 'app' @('Tests/app_mock','App','Algorithm','Board','Display') @('Tests/test_gesture_app.c','Algorithm/gesture_engine.c')
+Invoke-CTest 'app' @('Tests/app_mock','App','Algorithm','Board','Display') @('Tests/test_gesture_app.c','App/gesture_config.c','Algorithm/gesture_engine.c')
 Invoke-CTest 'usb' @('Tests/app_mock','App','USB_DEVICE/App') @('Tests/test_gesture_usb.c')
 & $PythonPath -m unittest discover -s (Join-Path $projectDirectory 'Tests') -p 'test_gesture_host.py' -v
 if ($LASTEXITCODE -ne 0) { throw 'Host protocol tests failed.' }

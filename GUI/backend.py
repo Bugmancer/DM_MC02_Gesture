@@ -117,6 +117,9 @@ class Controller:
                         "usb_drops": 0, "max_feed_us": 0, "max_read_us": 0}
         self._protocol = {"version": None, "inventory": False, "manual_training": False,
                           "firmware": None, "capabilities": [], "requires_calibration": False}
+        self._config = {"class_limit": 8, "demo_target": 3, "reported": False}
+        self._config_write = {"state": "idle", "message": ""}
+        self._config_write_started = None
         self._slots = [{"id": i, "state": "unknown", "templates": None,
                         "board_name": ""} for i in range(1, 9)]
         self._training = {"state": "idle", "slot": None, "collected": 0,
@@ -141,6 +144,7 @@ class Controller:
         self._key = {"available": False, "down": None}
         self._pose.reset()
         self._pen_motion.reset()
+        self._pen_correction_cursor = 0
         self._last_pose_sample = None
         self._reset_pen()
 
@@ -172,6 +176,8 @@ class Controller:
         motion = self._pose.world_motion()
         pen = self._pen_motion.snapshot()
         corrections = self._pen_motion.corrections() if key_down is False and self._last_pen_key is True else []
+        if corrections:
+            self._pen_correction_cursor = corrections[-1]["stroke_id"]
         corrected_trail = next((item["points"] for item in reversed(corrections)
                                 if item["stroke_id"] == pen["stroke_id"]), None)
         self._pose.set_translation(pen["position_m"], pen["velocity_m_s"],
@@ -257,12 +263,17 @@ class Controller:
     def close(self):
         self.disconnect()
 
-    def snapshot(self, after=0):
+    def snapshot(self, after=0, pen_after=0):
         after = _integer(after, 0, 2**63 - 1)
+        pen_after = _integer(pen_after, 0, 2**63 - 1)
         with self._lock:
+            if (self._config_write["state"] == "pending" and
+                    time.monotonic() - self._config_write_started > 10):
+                self._config_write = {"state": "failed", "message": "板端未确认保存，请刷新配置后重试"}
             slots = [{**slot, **self._settings[str(slot["id"])],
-                      "color": SLOT_COLORS[slot["id"] - 1][0],
-                      "color_name": SLOT_COLORS[slot["id"] - 1][1]} for slot in self._slots]
+                      "enabled": slot["id"] <= self._config["class_limit"],
+                      "color": slot.get("color", SLOT_COLORS[slot["id"] - 1][0]),
+                      "color_name": slot.get("color", SLOT_COLORS[slot["id"] - 1][1])} for slot in self._slots]
             pose = self._pose.snapshot()
             key = dict(self._key)
             if self._last_pose_sample is not None and time.monotonic() - self._last_pose_sample > 0.5:
@@ -279,12 +290,15 @@ class Controller:
             if self._last_match is None or time.monotonic() - self._last_match > 0.8:
                 live_match["id"] = 0
             recent_match = None
+            match_hold = 3 if "AUTO_RECOGNITION" in self._protocol["capabilities"] else 0.35
             if (self._status["armed"] and self._last_confident_match is not None
-                    and time.monotonic() - self._last_confident_match <= 0.35):
+                    and time.monotonic() - self._last_confident_match <= match_hold):
                 recent_match = self._recent_match
+            corrections = self._pen_motion.corrections(pen_after)
             return copy.deepcopy({
                 "connection": self._connection, "status": self._status,
-                "protocol": self._protocol, "slots": slots, "training": self._training,
+                "protocol": self._protocol, "config": self._config, "config_write": self._config_write,
+                "slots": slots, "training": self._training,
                 "pending_delete": self._pending_delete, "hotkeys_enabled": self._hotkeys_enabled,
                 "counters": self._counters, "waveform": list(self._waveform),
                 "events": [event for event in self._events if event["seq"] > after],
@@ -292,7 +306,7 @@ class Controller:
                 "pose": pose, "live_match": live_match, "recent_match": recent_match,
                 "pen_samples": list(self._pen_samples), "pen_cursor": self._pen_cursor,
                 "pen_epoch": self._pen_epoch,
-                "pen_corrections": self._pen_motion.corrections(),
+                "pen_corrections": corrections, "pen_correction_cursor": self._pen_correction_cursor,
                 "key": key,
                 "pen_motion": pen_motion,
             })
@@ -301,6 +315,7 @@ class Controller:
         with self._lock:
             self._pose.zero()
             self._pen_motion.reset()
+            self._pen_correction_cursor = 0
             self._reset_pen()
             self._log("POSE", "Origin reset")
         return self.snapshot()
@@ -322,6 +337,10 @@ class Controller:
                 raise ValueError("Simulated KEY is available only on the demo device")
             if name.startswith("learn ") and not self._protocol["manual_training"]:
                 raise ValueError("Update board firmware to support KEY-controlled learning")
+            if name.startswith(("learn ", "delete ")) and int(name.split()[1]) > self._config["class_limit"]:
+                raise ValueError("This slot is disabled in the board configuration")
+            if name in {"arm", "disarm"} and "AUTO_RECOGNITION" in self._protocol["capabilities"]:
+                raise ValueError("Recognition is controlled automatically by the board")
             if name in {"disarm", "cancel", "calibrate"} or name.startswith(("learn ", "delete ")):
                 self._hotkeys_enabled = False
             self._queue_command(name)
@@ -333,6 +352,32 @@ class Controller:
             self._commands.put_nowait(name)
         except queue.Full as error:
             raise ValueError("Too many pending commands; wait for the board") from error
+
+    def configure_board(self, payload):
+        """Queue one transactional Flash update; only board ACK confirms success."""
+        limit = _integer(payload.get("class_limit"), 1, 8)
+        demos = _integer(payload.get("demo_target"), 1, 3)
+        colors = payload.get("colors")
+        if (not isinstance(colors, list) or len(colors) != 8 or
+                any(not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value)
+                    for value in colors)):
+            raise ValueError("Eight RGB colors in #RRGGBB format are required")
+        command = f"configure {limit} {demos} " + " ".join(value[1:].lower() for value in colors)
+        with self._lock:
+            if self._connection["state"] != "connected":
+                raise ValueError("请先连接设备")
+            if "GUI_CONFIG" not in self._protocol["capabilities"]:
+                raise ValueError("网页修改板端配置需要 r8 固件")
+            if self._training["state"] != "idle" or self._pending_delete is not None:
+                raise ValueError("请先完成或取消学习、删除操作")
+            if self._config_write["state"] == "pending":
+                raise ValueError("板端正在保存配置，请稍候")
+            self._queue_command(command)
+            self._hotkeys_enabled = False
+            self._config_write = {"state": "pending", "message": "正在写入板载 Flash…"}
+            self._config_write_started = time.monotonic()
+            self._log("COMMAND", "Save board configuration")
+        return self.snapshot()
 
     def save_slot(self, slot, name, hotkey=""):
         slot = _integer(slot, 1, 8)
@@ -397,7 +442,7 @@ class Controller:
             raise OSError("Incomplete serial command write")
 
     def _sync_commands(self):
-        for command in ("stream 0", "disarm", "status", "list"):
+        for command in ("stream 0", "status", "list"):
             self._queue_command(command)
 
     @staticmethod
@@ -405,7 +450,7 @@ class Controller:
         if connection is None:
             return
         if orderly:
-            for command in ("disarm", "stream 0"):
+            for command in ("stream 0",):
                 try:
                     Controller._write(connection, command)
                 except Exception:
@@ -475,11 +520,14 @@ class Controller:
                     if attempts:
                         port = self._recovery_port(port, identity)
                     connection = factory(port, baudrate=115200, timeout=0.05, write_timeout=0.25)
+                    buffer_error = _host.configure_serial_buffers(connection)
                     connection.reset_input_buffer()
                     with self._lock:
                         self._serial = connection
                         self._connection["port"] = port
                         self._log("CONNECTING", f"{port}: waiting for board status")
+                        if buffer_error:
+                            self._log("SERIAL", "Serial buffer sizing unavailable", detail=buffer_error)
                         self._sync_commands()
                     self._serial_session(connection)
                     break
@@ -631,11 +679,24 @@ class Controller:
                 raise ValueError("Invalid firmware capability")
             changed = self._protocol["firmware"] != fields[0] or self._protocol["capabilities"] != fields[1:]
             self._protocol.update(firmware=fields[0], capabilities=fields[1:])
-            self._training["required"] = 1 if "ONE_DEMO" in fields else 3
+            self._training["required"] = (self._config["demo_target"] if self._config["reported"] else
+                                           1 if "ONE_DEMO" in fields else 3)
             if "KEY_CAPTURE" in fields:
                 self._protocol["manual_training"] = True
             if changed:
                 self._log(kind, ", ".join(fields))
+        elif kind == "CONFIG":
+            self._config.update(class_limit=record["class_limit"], demo_target=record["demo_target"], reported=True)
+            self._training["required"] = record["demo_target"]
+            self._protocol["inventory"] = all(slot["state"] != "unknown" for slot in self._slots[:record["class_limit"]])
+        elif kind == "COLOR":
+            self._slots[record["id"] - 1]["color"] = record["color"]
+        elif kind == "CONFIG_RESULT":
+            if fields not in (["SAVED"], ["FAILED"]):
+                raise ValueError("Invalid configuration result")
+            self._config_write = {"state": "saved" if fields[0] == "SAVED" else "failed",
+                                  "message": "已保存到板载 Flash" if fields[0] == "SAVED" else "板端保存失败，修改未生效，请重试"}
+            self._log(kind, ", ".join(fields))
         elif kind == "INFO":
             if len(fields) != 8:
                 raise ValueError("INFO requires eight fields")
@@ -671,7 +732,7 @@ class Controller:
             slot, templates = _integer(fields[0], 1, 8), _integer(fields[1], 0, 16)
             self._slots[slot - 1].update(state="saved" if templates else "empty",
                                          templates=templates, board_name=fields[2])
-            self._protocol["inventory"] = all(slot["state"] != "unknown" for slot in self._slots)
+            self._protocol["inventory"] = all(slot["state"] != "unknown" for slot in self._slots[:self._config["class_limit"]])
         elif kind == "STATE":
             if fields == ["ARMED"]:
                 self._status["armed"] = 1
@@ -730,7 +791,6 @@ class Controller:
             slot = _integer(fields[0], 1, 8)
             self._training.update(state="idle", slot=None, collected=0, message="", capturing=False, warning=None)
             self._pending_delete = None
-            self._status["armed"] = 0
             self._hotkeys_enabled = False
             self._slots[slot - 1].update(state="unknown", templates=None)
             self._protocol["inventory"] = False
@@ -739,7 +799,7 @@ class Controller:
         elif kind == "MATCH":
             self._live_match = {key: value for key, value in record.items() if key != "kind"}
             self._last_match = time.monotonic()
-            if record["id"]:
+            if record["id"] and "AUTO_RECOGNITION" not in self._protocol["capabilities"]:
                 self._recent_match = dict(self._live_match)
                 self._last_confident_match = self._last_match
         elif kind == "EVENT":
@@ -749,6 +809,9 @@ class Controller:
                 return
             self._seen_events.append(identity)
             self._counters["events"] += 1
+            if "AUTO_RECOGNITION" in self._protocol["capabilities"]:
+                self._recent_match = {key: value for key, value in record.items() if key != "kind"}
+                self._last_confident_match = time.monotonic()
             slot = self._settings[str(record["id"])]
             self._log(kind, slot["name"], **{key: value for key, value in record.items() if key != "kind"})
             fence = self._hotkey_fence
@@ -781,20 +844,24 @@ class Controller:
 
     def _demo_inventory(self):
         training = self._training
-        self._accept(parse_line("FIRMWARE,demo-gesture-20261005-r5,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY"))
+        self._accept(parse_line("FIRMWARE,demo-gesture-20261006-r8,KEY_CAPTURE,NO_CALIBRATION,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG"))
+        self._accept(parse_line(f"CONFIG,{self._config['class_limit']},{self._config['demo_target']}"))
         self._accept(parse_line(f"INFO,1,7,1,{int(training['state'] != 'idle')},"
                                f"{self._pending_delete or training['slot'] or 1},{training['collected']},"
                                f"{int(training['state'] == 'ready')},{int(self._pending_delete is not None)}"))
         for slot in self._demo_slots:
             count = self._demo_saved.get(slot, 0)
             self._accept(parse_line(f"SLOT,{slot},{count}," + (f"Demo {slot}" if count else "")))
+            color = self._slots[slot - 1].get("color", SLOT_COLORS[slot - 1][0])
+            self._accept(parse_line(f"COLOR,{slot},{color[1:]}"))
         self._accept(parse_line("CAPTURE,MODE,KEY"))
-        if training["state"] != "idle" and training["collected"] < 3:
+        if training["state"] != "idle" and training["collected"] < training["required"]:
             state = "BEGIN" if training["capturing"] else "WAIT"
             self._accept(parse_line(f"CAPTURE,{state},{training['slot']}"))
 
     def _demo_status(self, stamp):
-        self._accept(parse_line(f"STATUS,{stamp},{self._status['armed']},{len(self._demo_saved)},"
+        active_classes = sum(slot <= self._config["class_limit"] for slot in self._demo_saved)
+        self._accept(parse_line(f"STATUS,{stamp},{self._status['armed']},{active_classes},"
                                f"1,{self._demo_seq},0,0,{self._counters['unknown']},0,420,90"))
 
     def _demo_command(self, command):
@@ -803,7 +870,7 @@ class Controller:
             down = arg == "key 1"
             pressed, released = down and not self._demo_key_down, not down and self._demo_key_down
             self._demo_key_down = down
-            if self._training["state"] not in {"recording", "ready"} or self._training["collected"] >= 3:
+            if self._training["state"] not in {"recording", "ready"} or self._training["collected"] >= self._training["required"]:
                 return
             slot = self._training["slot"]
             if pressed and self._demo_key_started is None:
@@ -819,8 +886,12 @@ class Controller:
                 else:
                     count = self._training["collected"] + 1
                     self._accept(parse_line(f"TRAIN,DEMO,{slot},{count}"))
-                    self._accept(parse_line(f"TRAIN,READY,{slot},{count}"))
-                if self._training["collected"] < 3:
+                    if count >= self._training["required"]:
+                        self._accept(parse_line(f"TRAIN,READY,{slot},{count}"))
+                        self._demo_saved[slot] = count
+                        self._accept(parse_line(f"SAVED,{slot},1024"))
+                        self._accept(parse_line("STATE,ARMED"))
+                if self._training["state"] != "idle" and self._training["collected"] < self._training["required"]:
                     self._accept(parse_line(f"CAPTURE,WAIT,{slot}"))
         elif name in {"list", "status"}:
             self._demo_inventory() if name == "list" else self._demo_status(self._demo_seq * 5)
@@ -845,14 +916,21 @@ class Controller:
                 slot = self._pending_delete
                 self._demo_saved.pop(slot, None)
                 self._accept(parse_line(f"DELETED,{slot},1024"))
-                self._accept(parse_line("STATE,IDLE"))
+                self._accept(parse_line("STATE,ARMED"))
             elif self._training["state"] == "ready" and not self._training["capturing"]:
                 slot = self._training["slot"]
                 self._demo_saved[slot] = self._training["collected"]
                 self._accept(parse_line(f"SAVED,{slot},1024"))
-                self._accept(parse_line("STATE,IDLE"))
+                self._accept(parse_line("STATE,ARMED"))
             else:
                 self._accept(parse_line("ERROR,SAVE,NOT_READY"))
+        elif name == "configure":
+            values = arg.split()
+            self._accept(parse_line(f"CONFIG,{values[0]},{values[1]}"))
+            for index, color in enumerate(values[2:], start=1):
+                self._accept(parse_line(f"COLOR,{index},{color}"))
+            self._accept(parse_line("CONFIG_RESULT,SAVED"))
+            self._accept(parse_line("STATE,ARMED"))
         elif name == "arm":
             if self._training["state"] != "idle" or self._pending_delete:
                 self._accept(parse_line("ERROR,ARM,BUSY"))
@@ -864,6 +942,7 @@ class Controller:
             self._accept(parse_line("STATE,IDLE"))
             if name == "calibrate":
                 self._accept(parse_line("CALIBRATION,OK"))
+            self._accept(parse_line("STATE,ARMED"))
         elif name == "stream":
             self._demo_stream = arg == "1"
 
@@ -876,6 +955,7 @@ class Controller:
                 self._demo_seq = 0
                 self._demo_stream = True
                 self._accept(parse_line("HELLO,DEMO_SIMULATOR,1"))
+                self._accept(parse_line("STATE,ARMED"))
                 self._demo_inventory()
                 self._demo_status(0)
                 self._log("SIMULATION", "Demo data; no physical board and no real keyboard output")

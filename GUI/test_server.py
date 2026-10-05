@@ -51,6 +51,20 @@ class ServerTests(unittest.TestCase):
         status, body, _ = self.request("/api/session.json")
         self.assertEqual(json.loads(body)["token"], self.server.token)
 
+    def test_board_config_endpoint_is_authenticated_and_validated(self):
+        payload = {"class_limit": 4, "demo_target": 2, "colors": ["#654321"] * 8}
+        self.request("/api/connect", {"demo": True})
+        deadline = time.monotonic() + 2
+        while "GUI_CONFIG" not in self.controller.snapshot()["protocol"]["capabilities"] and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(self.request("/api/board/config", payload, {"X-Gesture-Token": "invalid"})[0], 403)
+        self.assertEqual(self.request("/api/board/config", {**payload, "class_limit": 9})[0], 400)
+        self.assertEqual(self.request("/api/board/config", payload)[0], 200)
+        deadline = time.monotonic() + 2
+        while self.controller.snapshot()["config_write"]["state"] == "pending" and time.monotonic() < deadline:
+            time.sleep(.01)
+        self.assertEqual(self.controller.snapshot()["config"]["class_limit"], 4)
+
     def test_ui_identity_matches_html_state_and_mutations(self):
         identity = self.server.identity()
         self.assertRegex(identity["ui_revision"], r"^[a-f0-9]{20}$")
@@ -111,8 +125,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request("/api/download?file=../settings.json")[0], 400)
         self.assertEqual(self.request("/api/download?file=missing.csv")[0], 404)
         self.assertEqual(self.request("/api/state?after=oops")[0], 400)
+        self.assertEqual(self.request("/api/state?pen_after=oops")[0], 400)
+        self.assertEqual(self.request("/api/state?pen_after=-1")[0], 400)
         self.assertEqual(self.request("/api/command", ["arm"])[0], 400)
         self.assertEqual(self.request("/api/command", {"command": "bad"})[0], 400)
+
+    def test_state_only_transmits_unseen_pen_corrections(self):
+        for seq, down in enumerate((0, 1, 1, 0), start=1):
+            self.controller._process_line(f"RAW,{seq},{seq * 5},0,0,9807,0,0,0,{down}")
+        state = json.loads(self.request("/api/state")[1])
+        self.assertEqual(len(state["pen_corrections"]), 1)
+        for _ in range(4):
+            delta = json.loads(self.request("/api/state?pen_after=1")[1])
+            self.assertEqual(delta["pen_corrections"], [])
+            self.assertEqual(delta["pen_correction_cursor"], 1)
 
     def test_demo_capture_download_and_hotkey_rejection(self):
         self.assertEqual(self.request("/api/connect", {"demo": True})[0], 200)

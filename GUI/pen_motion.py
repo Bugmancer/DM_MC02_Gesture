@@ -138,10 +138,10 @@ class PenMotion:
         self.reason = "stationary" if stationary else "recording"
         return self._position.tolist()
 
-    def corrections(self):
+    def corrections(self, after=0):
         return [{"stroke_id": item["stroke_id"],
                  "points": [point.copy() for point in item["points"]]}
-                for item in self._corrections]
+                for item in self._corrections if item["stroke_id"] > after]
 
     def snapshot(self):
         return {

@@ -2,6 +2,7 @@
 #include "gesture_usb.h"
 #include "gesture_board.h"
 #include "gesture_engine.h"
+#include "gesture_config.h"
 #include "display.h"
 #include "main.h"
 #include "tim.h"
@@ -10,8 +11,9 @@
 
 static ge_engine_t engine;
 static display_view_t view;
-static uint8_t model_blob[GE_MODEL_BLOB_MAX];
-static uint8_t rollback_blob[GE_MODEL_BLOB_MAX];
+static uint8_t model_blob[GC_BLOB_MAX];
+static gesture_config_t config, config_draft;
+static uint8_t settings_open, settings_row, settings_slot;
 static volatile uint32_t sample_ticks;
 static uint32_t processed_ticks, ready_mask, samples, sample_drops, imu_errors;
 static uint32_t unknown_count, recognized_count, max_feed_cycles, max_read_cycles;
@@ -22,10 +24,14 @@ static uint8_t user_was_down, capture_key_ready, capture_held, capture_interrupt
 static uint32_t capture_release_since;
 static uint32_t last_rgb = 0xffffffffu;
 static uint32_t rgb_match_until;
+static uint32_t rgb_accepted_until;
 static uint8_t rgb_match_slot = GE_CLASS_NONE;
 
 static void engine_events(uint32_t now);
 static void update_rgb(uint32_t now);
+static void set_armed(int enable);
+static void settings_begin(void);
+static void settings_key(BoardKey key);
 
 static void show_match_rgb(uint8_t slot, uint32_t now, uint32_t hold_ms)
 {
@@ -39,7 +45,7 @@ static void show_match_rgb(uint8_t slot, uint32_t now, uint32_t hold_ms)
 
 static void report_firmware(void)
 {
-    gesture_usb_log(0, "FIRMWARE,gesture-20261005-r6,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY\r\n");
+    gesture_usb_log(0, "FIRMWARE,gesture-20261006-r8,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG\r\n");
 }
 
 static void report_capture(void)
@@ -58,6 +64,7 @@ static void reset_stream(void)
 {
     processed_ticks = sample_ticks;
     rgb_match_slot = GE_CLASS_NONE;
+    rgb_accepted_until = 0u;
     ge_reset_stream(&engine);
 }
 
@@ -75,10 +82,9 @@ static void cancel(void)
     capture_held = capture_interrupted = capture_key_ready = 0u;
     ge_train_cancel(&engine);
     training = delete_confirm = 0u;
-    disarm();
+    settings_open = 0u;
     transient_until = 0u;
-    view.state = DISPLAY_STATE_IDLE;
-    message("Ready");
+    set_armed(1);
 }
 
 static void update_view(void)
@@ -86,7 +92,13 @@ static void update_view(void)
     uint8_t i;
     view.selected_slot = selected;
     view.learning_count = ge_training_progress(&engine);
-    view.learning_target = GE_TEMPLATES_PER_CLASS;
+    view.learning_target = config.demo_target;
+    view.settings_open = settings_open;
+    view.settings_row = settings_row;
+    view.class_limit = settings_open ? config_draft.class_limit : config.class_limit;
+    view.config_demos = settings_open ? config_draft.demo_target : config.demo_target;
+    view.config_slot = settings_slot;
+    memcpy(view.slot_colors, settings_open ? config_draft.colors : config.colors, sizeof(view.slot_colors));
     view.imu_ok = (uint8_t)((ready_mask & BOARD_READY_IMU) && !consecutive_errors);
     view.flash_ok = (uint8_t)((ready_mask & BOARD_READY_FLASH) != 0u);
     view.power_ok = 1u; /* Running from the system rail; no battery gauge is fitted here. */
@@ -114,6 +126,7 @@ static void calibrate(void)
         return;
     }
     cancel();
+    disarm();
     (void)HAL_TIM_Base_Stop_IT(&htim7);
     message("Lay flat: calibrating gyro");
     startup_paint(120u);
@@ -128,25 +141,22 @@ static void calibrate(void)
         message("Sample timer failed");
         view.state = DISPLAY_STATE_ERROR;
         gesture_usb_log(0, "ERROR,CALIBRATE,TIMER_FAILED\r\n");
-    }
+    } else set_armed(1);
 }
 
 static void set_armed(int enable)
 {
     if (!enable) { cancel(); return; }
     if (!(ready_mask & BOARD_READY_IMU) || consecutive_errors >= 3u) {
+        disarm();
+        view.state = DISPLAY_STATE_ERROR;
         message("IMU missing. Check board and reset");
         gesture_usb_log(0, "ERROR,ARM,IMU_UNAVAILABLE\r\n");
         return;
     }
-    if (training || delete_confirm) {
+    if (training || delete_confirm || settings_open) {
         message("Finish or cancel learning first");
         gesture_usb_log(0, "ERROR,ARM,BUSY\r\n");
-        return;
-    }
-    if (!ge_class_count(&engine)) {
-        message("No saved gestures. OK to learn");
-        gesture_usb_log(0, "ERROR,ARM,NO_GESTURES\r\n");
         return;
     }
     reset_stream();
@@ -154,7 +164,7 @@ static void set_armed(int enable)
     ge_set_recognition(&engine, 1);
     transient_until = 0u;
     view.state = DISPLAY_STATE_ARMED;
-    message("Recognition enabled");
+    message(ge_active_class_count(&engine) ? "Automatic recognition" : "No gestures. OK to learn");
     gesture_usb_log(0, "STATE,ARMED\r\n");
 }
 
@@ -162,7 +172,7 @@ static void begin_learning(uint8_t slot)
 {
     ge_status_t status;
     char name[GE_NAME_BYTES];
-    if (training || delete_confirm) {
+    if (training || delete_confirm || settings_open) {
         message("Finish or cancel current operation");
         gesture_usb_log(0, "ERROR,LEARN,BUSY\r\n");
         return;
@@ -177,11 +187,16 @@ static void begin_learning(uint8_t slot)
         gesture_usb_log(0, "ERROR,LEARN,FLASH_UNAVAILABLE\r\n");
         return;
     }
+    if (slot >= config.class_limit) {
+        message("Slot disabled in device settings");
+        gesture_usb_log(0, "ERROR,LEARN,SLOT_DISABLED\r\n");
+        return;
+    }
     disarm();
     (void)snprintf(name, sizeof(name), "Gesture %u", (unsigned)slot + 1u);
     status = ge_train_begin_at(&engine, slot, name);
     if (status != GE_OK) {
-        view.state = DISPLAY_STATE_IDLE;
+        set_armed(1);
         message(ge_status_string(status));
         gesture_usb_log(0, "ERROR,LEARN,%s\r\n", ge_status_string(status));
         return;
@@ -200,7 +215,7 @@ static void begin_learning(uint8_t slot)
 
 static void request_delete(uint8_t slot)
 {
-    if (training) {
+    if (training || settings_open) {
         message("Finish or cancel learning first");
         gesture_usb_log(0, "ERROR,DELETE,BUSY\r\n");
         return;
@@ -221,13 +236,16 @@ static void request_delete(uint8_t slot)
 
 static void save_model(void)
 {
-    size_t old_size, new_size;
+    size_t new_size;
+    ge_class_t previous;
+    ge_class_t *candidate;
     uint8_t id = selected;
-    ge_status_t status;
+    ge_status_t status = GE_OK;
     int deleting = delete_confirm != 0u;
+    int saved = 0;
     const char *operation = deleting ? "DELETE" : "SAVE";
-    if ((!training || !ge_training_ready(&engine) || capture_held) && !deleting) {
-        message(capture_held ? "Release KEY before saving" : "One accepted demo required");
+    if ((!training || ge_training_progress(&engine) < config.demo_target || capture_held) && !deleting) {
+        message(capture_held ? "Release KEY before saving" : "Complete configured demonstrations");
         gesture_usb_log(0, "ERROR,SAVE,NOT_READY\r\n");
         return;
     }
@@ -236,56 +254,211 @@ static void save_model(void)
         gesture_usb_log(0, "ERROR,%s,FLASH_UNAVAILABLE\r\n", operation);
         return;
     }
-    old_size = ge_model_export(&engine, rollback_blob, sizeof(rollback_blob));
-    if (!old_size) {
-        message("Model backup failed");
-        gesture_usb_log(0, "ERROR,%s,BACKUP_FAILED\r\n", operation);
-        return;
-    }
     (void)HAL_TIM_Base_Stop_IT(&htim7);
     ge_reset_stream(&engine);
     view.state = DISPLAY_STATE_SAVING;
     message("Writing templates to Flash");
     startup_paint(80u);
-    status = deleting ? ge_class_delete(&engine, selected) : ge_train_confirm(&engine, &id);
-    new_size = status == GE_OK ? ge_model_export(&engine, model_blob, sizeof(model_blob)) : 0u;
+    candidate = &engine.model.classes[selected];
+    previous = *candidate;
+    memset(candidate, 0, sizeof(*candidate));
+    if (!deleting) {
+        candidate->used = 1u;
+        candidate->template_count = ge_training_progress(&engine);
+        candidate->threshold = engine.pending_threshold;
+        memcpy(candidate->name, engine.pending_name, sizeof(candidate->name));
+        memcpy(candidate->templates, engine.pending, sizeof(candidate->templates));
+    }
+    new_size = gc_export(&config, &engine, model_blob, sizeof(model_blob));
+    *candidate = previous;
+    /* Persist a candidate image before committing the engine transaction, so a
+     * failed write leaves every accepted demonstration available for retry. */
     if (new_size && board_store_save(model_blob, (uint32_t)new_size)) {
-        message(deleting ? "Deleted. Recognition disabled" : "Saved. UP enables recognition");
+        status = deleting ? ge_class_delete(&engine, selected) : ge_train_confirm(&engine, &id);
+        saved = status == GE_OK;
+    }
+    if (saved) {
         gesture_usb_log(0, "%s,%u,%lu\r\n", deleting ? "DELETED" : "SAVED",
                         (unsigned)id + 1u, (unsigned long)new_size);
-        view.state = DISPLAY_STATE_IDLE;
+        training = delete_confirm = 0u;
+        capture_held = capture_interrupted = capture_key_ready = 0u;
     } else {
-        ge_train_cancel(&engine);
-        ge_reset_stream(&engine);
-        (void)ge_model_import(&engine, rollback_blob, old_size);
-        message("Save failed. Previous model restored");
+        message("Save failed. OK retries; DOWN cancels");
         gesture_usb_log(0, "ERROR,SAVE_ROLLED_BACK\r\n");
         gesture_usb_log(0, "ERROR,%s,ROLLED_BACK\r\n", operation);
-        view.state = DISPLAY_STATE_ERROR;
+        view.state = deleting ? DISPLAY_STATE_CONFIRM : DISPLAY_STATE_READY;
     }
-    ge_train_cancel(&engine);
-    training = delete_confirm = 0u;
-    disarm();
     if (HAL_TIM_Base_Start_IT(&htim7) != HAL_OK) {
         ready_mask &= ~BOARD_READY_IMU;
+        disarm();
         message("Sample timer failed");
         view.state = DISPLAY_STATE_ERROR;
         gesture_usb_log(0, "ERROR,%s,TIMER_FAILED\r\n", operation);
+    } else if (saved) {
+        set_armed(1);
+        message(deleting ? "Deleted. Automatic recognition" : "Saved. Automatic recognition");
     }
+}
+
+static void report_config(void)
+{
+    char lines[160];
+    unsigned slot, offset;
+    offset = (unsigned)snprintf(lines, sizeof(lines), "CONFIG,%u,%u\r\n",
+        (unsigned)config.class_limit, (unsigned)config.demo_target);
+    for (slot = 0u; slot < GE_MAX_CLASSES; ++slot)
+        offset += (unsigned)snprintf(lines + offset, sizeof(lines) - offset,
+            "COLOR,%u,%06lX\r\n", slot + 1u, (unsigned long)config.colors[slot]);
+    gesture_usb_log(0, "%s", lines);
+}
+
+static void settings_begin(void)
+{
+    if (training || delete_confirm) {
+        message("Finish or cancel learning first");
+        gesture_usb_log(0, "ERROR,CONFIG,BUSY\r\n");
+        return;
+    }
+    disarm();
+    config_draft = config;
+    settings_open = 1u;
+    settings_row = 0u;
+    settings_slot = selected < config.class_limit ? selected : 0u;
+    transient_until = 0u;
+    view.state = DISPLAY_STATE_IDLE;
+    message("Device settings");
+    update_view();
+}
+
+static int settings_save(void)
+{
+    size_t length;
+    int saved;
+    if (!(ready_mask & BOARD_READY_FLASH)) {
+        message("Flash unavailable; settings not saved");
+        gesture_usb_log(0, "ERROR,CONFIG,FLASH_UNAVAILABLE\r\n");
+        return 0;
+    }
+    length = gc_export(&config_draft, &engine, model_blob, sizeof(model_blob));
+    (void)HAL_TIM_Base_Stop_IT(&htim7);
+    saved = length && board_store_save(model_blob, (uint32_t)length);
+    reset_stream();
+    if (saved) {
+        config = config_draft;
+        (void)ge_set_class_limit(&engine, config.class_limit);
+        if (selected >= config.class_limit) selected = (uint8_t)(config.class_limit - 1u);
+        settings_open = 0u;
+        report_config();
+    } else {
+        message("Settings save failed. OK retries");
+        gesture_usb_log(0, "ERROR,CONFIG,SAVE_FAILED\r\n");
+    }
+    if (HAL_TIM_Base_Start_IT(&htim7) != HAL_OK) {
+        ready_mask &= ~BOARD_READY_IMU;
+        view.state = DISPLAY_STATE_ERROR;
+        message("Sample timer failed");
+        gesture_usb_log(0, "ERROR,CONFIG,TIMER_FAILED\r\n");
+    } else if (saved) set_armed(1);
+    update_view();
+    return saved;
+}
+
+/* One short command carries a complete configuration. Do not partially
+ * change channels or persist separate writes for each control in the GUI. */
+static void configure_command(const char *line)
+{
+    gesture_config_t candidate;
+    unsigned limit, demos, slot, digit;
+    char colors[GE_MAX_CLASSES][7], extra;
+    int parsed, saved;
+    parsed = sscanf(line, "configure %u %u %6s %6s %6s %6s %6s %6s %6s %6s %c",
+        &limit, &demos, colors[0], colors[1], colors[2], colors[3],
+        colors[4], colors[5], colors[6], colors[7], &extra);
+    if (parsed != 10 || limit < 1u || limit > GE_MAX_CLASSES ||
+        demos < 1u || demos > GE_TEMPLATES_PER_CLASS) goto invalid;
+    candidate = config;
+    candidate.class_limit = (uint8_t)limit;
+    candidate.demo_target = (uint8_t)demos;
+    for (slot = 0u; slot < GE_MAX_CLASSES; ++slot) {
+        uint32_t color = 0u;
+        if (strlen(colors[slot]) != 6u) goto invalid;
+        for (digit = 0u; digit < 6u; ++digit) {
+            unsigned char ch = (unsigned char)colors[slot][digit];
+            unsigned value;
+            if (ch >= '0' && ch <= '9') value = ch - '0';
+            else if (ch >= 'a' && ch <= 'f') value = ch - 'a' + 10u;
+            else if (ch >= 'A' && ch <= 'F') value = ch - 'A' + 10u;
+            else goto invalid;
+            color = (color << 4) | value;
+        }
+        candidate.colors[slot] = color;
+    }
+    if (training || delete_confirm || settings_open) {
+        gesture_usb_log(0, "ERROR,CONFIG,BUSY\r\nCONFIG_RESULT,FAILED\r\n");
+        return;
+    }
+    disarm();
+    config_draft = candidate;
+    settings_open = 1u;
+    saved = settings_save();
+    if (!saved) {
+        settings_open = 0u;
+        if (ready_mask & BOARD_READY_IMU) set_armed(1);
+        update_view();
+    }
+    gesture_usb_log(0, "CONFIG_RESULT,%s\r\n", saved ? "SAVED" : "FAILED");
+    return;
+invalid:
+    gesture_usb_log(0, "ERROR,CONFIG,INVALID\r\nCONFIG_RESULT,FAILED\r\n");
+}
+
+static void settings_key(BoardKey key)
+{
+    int direction = key == BOARD_KEY_LEFT ? -1 : 1;
+    uint8_t *value = NULL;
+    if (key == BOARD_KEY_UP) settings_row = (uint8_t)((settings_row + 7u) % 8u);
+    else if (key == BOARD_KEY_DOWN) settings_row = (uint8_t)((settings_row + 1u) % 8u);
+    else if (key == BOARD_KEY_OK && settings_row == 6u) { settings_save(); return; }
+    else if (key == BOARD_KEY_OK && settings_row == 7u) { cancel(); update_view(); return; }
+    else if (key == BOARD_KEY_LEFT || key == BOARD_KEY_RIGHT || key == BOARD_KEY_OK) {
+        if (settings_row == 0u) value = &config_draft.class_limit;
+        if (settings_row == 1u) value = &config_draft.demo_target;
+        if (value) {
+            unsigned maximum = settings_row ? GE_TEMPLATES_PER_CLASS : GE_MAX_CLASSES;
+            if (direction > 0 && *value < maximum) ++*value;
+            if (direction < 0 && *value > 1u) --*value;
+            if (settings_slot >= config_draft.class_limit) settings_slot = (uint8_t)(config_draft.class_limit - 1u);
+        } else if (settings_row == 2u) {
+            settings_slot = (uint8_t)((settings_slot +
+                (direction > 0 ? 1u : config_draft.class_limit - 1u)) % config_draft.class_limit);
+        } else if (settings_row >= 3u && settings_row <= 5u) {
+            unsigned shift = (5u - settings_row) * 8u;
+            int channel = (int)((config_draft.colors[settings_slot] >> shift) & 255u);
+            channel = key == BOARD_KEY_OK ? (channel + 1) % 256 : channel + direction * 17;
+            if (channel < 0) channel = 0;
+            if (channel > 255) channel = 255;
+            config_draft.colors[settings_slot] = (config_draft.colors[settings_slot] & ~(255u << shift)) |
+                ((uint32_t)channel << shift);
+        }
+    }
+    update_view();
+    update_rgb(HAL_GetTick());
 }
 
 static void key_event(BoardKey key)
 {
+    if (settings_open) { settings_key(key); return; }
     switch (key) {
     case BOARD_KEY_LEFT:
     case BOARD_KEY_RIGHT:
-        if (!training && !delete_confirm) selected = (uint8_t)((selected + (key == BOARD_KEY_RIGHT ? 1u : 7u)) % 8u);
+        if (!training && !delete_confirm) selected = (uint8_t)((selected +
+            (key == BOARD_KEY_RIGHT ? 1u : config.class_limit - 1u)) % config.class_limit);
         break;
-    case BOARD_KEY_UP: set_armed(!armed); break;
+    case BOARD_KEY_UP: settings_begin(); break;
     case BOARD_KEY_USER: break; /* USER press/release is handled together below. */
     case BOARD_KEY_DOWN: cancel(); break;
     case BOARD_KEY_OK:
-        if (delete_confirm || (training && ge_training_ready(&engine))) save_model();
+        if (delete_confirm || (training && ge_training_progress(&engine) >= config.demo_target)) save_model();
         else if (!training && ge_class_get(&engine, selected)) request_delete(selected);
         else if (!training) begin_learning(selected);
         break;
@@ -305,7 +478,7 @@ static void user_key_process(uint32_t now)
        was already held (including a pending press) when learning began. */
     if (down) capture_release_since = now;
     else if ((uint32_t)(now - capture_release_since) >= 50u) capture_key_ready = 1u;
-    if (pressed && capture_key_ready && ge_training_progress(&engine) < GE_TEMPLATES_PER_CLASS) {
+    if (pressed && capture_key_ready && ge_training_progress(&engine) < config.demo_target) {
         capture_key_ready = 0u;
         status = ge_train_capture_begin(&engine, now);
         if (status == GE_OK) {
@@ -326,13 +499,15 @@ static void user_key_process(uint32_t now)
         status = ge_train_capture_end(&engine, now);
         engine_events(now);
         if (status == GE_ERR_NOT_READY) {
-            view.state = ge_training_ready(&engine) ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
+            view.state = ge_training_progress(&engine) >= config.demo_target ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
             message("Capture interrupted. HOLD KEY to retry");
             gesture_usb_log(0, "TRAIN,REJECT,%s\r\n",
                 capture_interrupted ? "SAMPLE GAP" : ge_status_string(status));
         }
         capture_interrupted = 0u;
-        if (ge_training_progress(&engine) < GE_TEMPLATES_PER_CLASS)
+        if (training && status == GE_OK && ge_training_progress(&engine) >= config.demo_target)
+            save_model();
+        if (training && ge_training_progress(&engine) < config.demo_target)
             gesture_usb_log(0, "CAPTURE,WAIT,%u\r\n", (unsigned)selected + 1u);
     }
 }
@@ -342,7 +517,7 @@ static void report_status(void)
     unsigned long mhz = (unsigned long)(SystemCoreClock / 1000000u);
     report_firmware();
     gesture_usb_log(0, "STATUS,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
-        (unsigned long)HAL_GetTick(), armed, ge_class_count(&engine), calibrated,
+        (unsigned long)HAL_GetTick(), armed, ge_active_class_count(&engine), calibrated,
         (unsigned long)samples, (unsigned long)sample_drops, (unsigned long)imu_errors,
         (unsigned long)unknown_count, (unsigned long)gesture_usb_drops(),
         (unsigned long)(max_feed_cycles / mhz), (unsigned long)(max_read_cycles / mhz));
@@ -356,7 +531,7 @@ static void report_inventory(void)
     gesture_usb_log(0, "INFO,1,%lu,%u,%u,%u,%u,%u,%u\r\n",
         (unsigned long)ready_mask, (unsigned)display_is_ok(), training,
         (unsigned)selected + 1u, (unsigned)ge_training_progress(&engine),
-        (unsigned)ge_training_ready(&engine), delete_confirm);
+        (unsigned)(training && ge_training_progress(&engine) >= config.demo_target), delete_confirm);
     for (slot = 0u; slot < GE_MAX_CLASSES; ++slot) {
         const ge_class_t *c = ge_class_get(&engine, (uint8_t)slot);
         char name[GE_NAME_BYTES];
@@ -377,6 +552,7 @@ static void report_inventory(void)
         }
     }
     report_capture();
+    report_config();
 }
 
 static void command(const char *line)
@@ -385,6 +561,8 @@ static void command(const char *line)
     char extra;
     if (!strcmp(line, "status")) report_status();
     else if (!strcmp(line, "list")) report_inventory();
+    else if (!strcmp(line, "config")) report_config();
+    else if (!strncmp(line, "configure ", 10u)) configure_command(line);
     else if (!strcmp(line, "arm")) set_armed(1);
     else if (!strcmp(line, "disarm") || !strcmp(line, "cancel")) cancel();
     else if (!strcmp(line, "save")) save_model();
@@ -413,7 +591,8 @@ static void engine_events(uint32_t now)
                 transient_until = 0u;
                 message(view.best_slot >= 0 ? "Matching gesture" : "Tracking motion");
             }
-            if (view.best_slot >= 0) show_match_rgb(event.class_id, now, 200u);
+            if (view.best_slot >= 0 && (int32_t)(rgb_accepted_until - now) <= 0)
+                show_match_rgb(event.class_id, now, 200u);
             gesture_usb_log(0, "MATCH,%lu,%u,%lu,%lu,%lu\r\n", (unsigned long)now,
                 view.best_slot >= 0 ? (unsigned)event.class_id + 1u : 0u,
                 (unsigned long)(event.distance < 1000.0f ? event.distance * 1000000.0f : 999999999.0f),
@@ -421,15 +600,16 @@ static void engine_events(uint32_t now)
                 (unsigned long)event.duration_ms);
             break;
         case GE_EVENT_RECOGNIZED:
-            if (!armed) break;
+            if (!armed || event.class_id >= config.class_limit) break;
             ++recognized_count;
             view.best_slot = (int8_t)event.class_id;
             view.best_score = event.distance;
             view.second_score = event.second_distance;
             view.state = DISPLAY_STATE_MATCH;
-            transient_until = now + 1200u;
+            transient_until = now + 3000u;
             message("Gesture accepted");
-            show_match_rgb(event.class_id, now, 1200u);
+            rgb_accepted_until = now + 3000u;
+            show_match_rgb(event.class_id, now, 3000u);
             gesture_usb_log(0, "EVENT,%lu,%u,%lu,%lu,%lu\r\n", (unsigned long)now,
                 (unsigned)event.class_id + 1u, (unsigned long)(event.distance * 1000000.0f),
                 (unsigned long)(event.second_distance < 1000.0f ? event.second_distance * 1000000.0f : 999999999.0f),
@@ -443,28 +623,30 @@ static void engine_events(uint32_t now)
             view.second_score = event.second_distance;
             view.state = DISPLAY_STATE_UNKNOWN;
             transient_until = now + 600u;
-            rgb_match_slot = GE_CLASS_NONE;
+            if ((int32_t)(rgb_accepted_until - now) <= 0) rgb_match_slot = GE_CLASS_NONE;
             message(event.status == GE_OK ? "No confident match" : ge_status_string(event.status));
             update_rgb(now);
             gesture_usb_log(0, "UNKNOWN,%lu,%s\r\n", (unsigned long)now,
                             event.status == GE_OK ? "NO_MATCH" : ge_status_string(event.status));
             break;
         case GE_EVENT_DEMO_ACCEPTED:
-            message(event.training_count < GE_TEMPLATES_PER_CLASS ? "Accepted. OK save or HOLD KEY add" : "3 demos accepted. OK to save");
+            message(event.training_count < config.demo_target ? "Accepted. HOLD KEY for next demo" : "Target reached. Saving automatically");
+            view.state = event.training_count < config.demo_target ? DISPLAY_STATE_LEARNING : DISPLAY_STATE_READY;
             gesture_usb_log(0, "TRAIN,DEMO,%u,%u\r\n", (unsigned)selected + 1u, event.training_count);
-            if (event.training_count > 1u && ge_training_ready(&engine)) {
+            if (event.training_count > 1u && event.training_count >= config.demo_target) {
                 view.state = DISPLAY_STATE_READY;
                 gesture_usb_log(0, "TRAIN,READY,%u,%u\r\n", (unsigned)selected + 1u, event.training_count);
             }
             break;
         case GE_EVENT_DEMO_REJECTED:
-            view.state = ge_training_ready(&engine) ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
+            view.state = ge_training_progress(&engine) >= config.demo_target ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
             (void)snprintf(view.message, sizeof(view.message), "%s. HOLD KEY to retry", ge_status_string(event.status));
             gesture_usb_log(0, "TRAIN,REJECT,%s\r\n", ge_status_string(event.status));
             break;
         case GE_EVENT_TRAIN_READY:
+            if (ge_training_progress(&engine) < config.demo_target) break;
             view.state = DISPLAY_STATE_READY;
-            message("Demo ready. OK save or HOLD KEY add");
+            message("Target reached. Saving automatically");
             gesture_usb_log(0, "TRAIN,READY,%u,%u\r\n", (unsigned)selected + 1u,
                 (unsigned)ge_training_progress(&engine));
             break;
@@ -480,8 +662,8 @@ static void engine_events(uint32_t now)
     }
     /* The accepted and ready events belong to the same capture; retain its warning. */
     if (similar_slot < GE_MAX_CLASSES) {
-        view.state = ge_training_ready(&engine) ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
-        (void)snprintf(view.message, sizeof(view.message), "Similar to slot %u. OK still saves",
+        view.state = ge_training_progress(&engine) >= config.demo_target ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
+        (void)snprintf(view.message, sizeof(view.message), "Similar to slot %u. Recording kept",
             (unsigned)similar_slot + 1u);
     }
 }
@@ -515,6 +697,7 @@ static void sample_once(uint32_t ticks)
     elapsed = DWT->CYCCNT - cycles;
     if (elapsed > max_read_cycles) max_read_cycles = elapsed;
     consecutive_errors = 0u;
+    if (!armed && !training && !delete_confirm && !settings_open) set_armed(1);
     ++samples;
     sample.timestamp_ms = raw.timestamp_ms;
     sample.ax = raw.accel[0]; sample.ay = raw.accel[1]; sample.az = raw.accel[2];
@@ -533,17 +716,14 @@ static void sample_once(uint32_t ticks)
 
 static void update_rgb(uint32_t now)
 {
-    static const uint32_t slot_colors[GE_MAX_CLASSES] = {
-        0x180000u, 0x001800u, 0x000018u, 0x181800u,
-        0x001818u, 0x180018u, 0x180800u, 0x181818u
-    };
     uint32_t color;
     if (view.state == DISPLAY_STATE_ERROR) color = (now / 150u) % 2u ? 0u : 0x180000u;
+    else if (settings_open) color = config_draft.colors[settings_slot];
     else if (training) {
-        if (capture_held) color = slot_colors[selected];
-        else color = ge_training_ready(&engine) ? 0x180c00u : 0x000004u;
+        if (capture_held) color = config.colors[selected];
+        else color = ge_training_progress(&engine) >= config.demo_target ? 0x180c00u : 0x000004u;
     } else if (armed && rgb_match_slot < GE_MAX_CLASSES && (int32_t)(rgb_match_until - now) > 0)
-        color = slot_colors[rgb_match_slot];
+        color = config.colors[rgb_match_slot];
     else if (view.state == DISPLAY_STATE_UNKNOWN) {
         uint32_t elapsed = now - (transient_until - 600u);
         color = (elapsed < 150u || (elapsed >= 300u && elapsed < 450u)) ? 0x180000u : 0u;
@@ -566,6 +746,8 @@ void gesture_app_init(void)
     ge_set_manual_training(&engine, 1);
     ge_set_streaming_recognition(&engine, 1);
     ge_set_recognition(&engine, 0);
+    gc_defaults(&config);
+    settings_open = settings_row = settings_slot = 0u;
     gesture_usb_init(command);
     memset(&view, 0, sizeof(view));
     view.best_slot = -1;
@@ -575,7 +757,7 @@ void gesture_app_init(void)
     ready_mask = board_init();
     user_was_down = board_user_key_down();
     if ((ready_mask & BOARD_READY_FLASH) && board_store_load(model_blob, sizeof(model_blob), &length)) {
-        if (ge_model_import(&engine, model_blob, length) != GE_OK) message("Stored model invalid; empty model");
+        if (gc_import(&config, &engine, model_blob, length) != GE_OK) message("Stored model invalid; empty model");
     }
     calibrated = 0u;
     if (ready_mask & BOARD_READY_IMU) {
@@ -586,7 +768,7 @@ void gesture_app_init(void)
             view.state = DISPLAY_STATE_ERROR;
             message("Sample timer failed");
             gesture_usb_log(0, "ERROR,STARTUP,TIMER_FAILED\r\n");
-        }
+        } else set_armed(1);
     } else {
         view.state = DISPLAY_STATE_ERROR;
         message("BMI088 not found. Check hardware");

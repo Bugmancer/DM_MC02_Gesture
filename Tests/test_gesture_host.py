@@ -90,6 +90,24 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(args.command, [])
         self.assertIsNone(args.hotkeys)
         self.assertFalse(args.keep_armed)
+        self.assertFalse(args.disarm_on_exit)
+
+    def test_board_config_and_actual_rgb(self):
+        self.assertEqual(host.parse_line("CONFIG,4,2"), {"kind": "CONFIG", "class_limit": 4, "demo_target": 2})
+        self.assertEqual(host.parse_line("COLOR,8,18A000"), {"kind": "COLOR", "id": 8, "color": "#18a000"})
+        for line in ("CONFIG,0,1", "CONFIG,9,1", "CONFIG,8,0", "CONFIG,8,4", "CONFIG,8", "COLOR,0,000000", "COLOR,1,FFF", "COLOR,1,GGGGGG"):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                host.parse_line(line)
+
+    def test_optional_serial_buffers_are_capability_checked_and_nonfatal(self):
+        self.assertIsNone(host.configure_serial_buffers(object()))
+        calls = []
+        port = SimpleNamespace(set_buffer_size=lambda **values: calls.append(values))
+        self.assertIsNone(host.configure_serial_buffers(port))
+        self.assertEqual(calls, [{"rx_size": 65536, "tx_size": 4096}])
+        def fail(**values):
+            raise OSError("driver rejected buffer sizing")
+        self.assertEqual(host.configure_serial_buffers(SimpleNamespace(set_buffer_size=fail)), "driver rejected buffer sizing")
 
 
 class HotkeyTests(unittest.TestCase):
@@ -185,7 +203,7 @@ class CaptureTests(unittest.TestCase):
             lines = output.with_suffix(".events.jsonl").read_text().splitlines()
             self.assertEqual(len(lines), 4)
             self.assertEqual(json.loads(lines[0])["raw"], "EVENT,17,1,125000,500000,650")
-            self.assertEqual(port.writes, [b"stream 1\n", b"status\n", b"stream 0\n", b"disarm\n"])
+            self.assertEqual(port.writes, [b"stream 0\n", b"status\n", b"list\n", b"stream 1\n", b"stream 0\n"])
             self.assertTrue(port.closed)
 
     def test_reset_failure_still_closes_and_records_error(self):
@@ -210,7 +228,7 @@ class CaptureTests(unittest.TestCase):
                 self.assertEqual(host.capture(args, module, {}, None), 1)
             summary = json.loads(output.with_suffix(".summary.json").read_text())
             self.assertEqual(summary["reason"], "error")
-            self.assertEqual(len(summary["exit_command_errors"]), 2)
+            self.assertEqual(len(summary["exit_command_errors"]), 1)
             self.assertTrue(port.closed)
 
 

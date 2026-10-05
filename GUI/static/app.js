@@ -13,6 +13,7 @@ const ui = {
   token: "",
   state: null,
   cursor: 0,
+  penCorrectionCursor: 0,
   events: [],
   selected: 1,
   tab: "library",
@@ -35,6 +36,10 @@ const ui = {
   trailVisible: true,
   reloading: false,
   serverInstance: "",
+  configDraft: null,
+  configDirty: false,
+  configSubmitting: false,
+  configSaving: false,
 };
 const slotColors = [
   "#ff0000",
@@ -71,6 +76,7 @@ const supportsManualTraining = () =>
   ui.state?.protocol?.manual_training === true;
 const hasCapability = (name) =>
   (ui.state?.protocol?.capabilities || []).includes(name);
+const autonomousRecognition = () => hasCapability("AUTO_RECOGNITION");
 const isDemo = () =>
   Boolean(ui.state?.connection?.demo || ui.state?.connection?.simulation);
 
@@ -220,6 +226,7 @@ function createSlotRows() {
     <tr data-slot="${slot.id}" class="${slot.id === 1 ? "selected" : ""}">
       <td>${pad(slot.id)}</td>
       <td><div class="slot-name"><span class="color-swatch" role="img"></span><input class="name-input" value="${escapeText(slot.name)}" maxlength="40" aria-label="槽位 ${slot.id} 动作名称"></div></td>
+      <td><input type="color" class="slot-color-input" value="${slot.color}" aria-label="槽位 ${slot.id} RGB 灯色" title="动作 ${slot.id} RGB 灯色" disabled></td>
       <td><div class="slot-state"><span class="mini-dot"></span><span class="slot-state-text">未同步</span></div></td>
       <td><input class="hotkey-input" placeholder="未映射" maxlength="80" aria-label="槽位 ${slot.id} 电脑快捷键" spellcheck="false" autocomplete="off"></td>
       <td><div class="slot-actions"><button class="icon-button learn-slot" title="学习动作 ${slot.id}" aria-label="学习动作 ${slot.id}" disabled><i data-lucide="circle-dot"></i></button><button class="icon-button delete-button" title="删除动作 ${slot.id}" aria-label="删除动作 ${slot.id}" disabled><i data-lucide="trash-2"></i></button></div></td>
@@ -228,6 +235,11 @@ function createSlotRows() {
     .join("");
   for (const row of $$("#slot-rows tr")) {
     const slot = Number(row.dataset.slot);
+    row.querySelector(".slot-color-input").addEventListener("input", (event) => {
+      configDraft().colors[slot - 1] = event.target.value;
+      ui.configDirty = true;
+      renderState();
+    });
     row.addEventListener("click", () => {
       ui.selected = slot;
       renderState();
@@ -260,6 +272,38 @@ function createSlotRows() {
   icons();
 }
 
+function configDraft() {
+  if (!ui.configDraft) ui.configDraft = {
+    class_limit: ui.state?.config?.class_limit || 8,
+    demo_target: ui.state?.config?.demo_target || 1,
+    colors: (ui.state?.slots || blankSlots()).map(slot => slot.color),
+  };
+  return ui.configDraft;
+}
+
+function renderBoardConfig() {
+  const writable = isConnected() && hasCapability("GUI_CONFIG") && ui.state.config?.reported;
+  const pending = ui.configSubmitting || ui.state?.config_write?.state === "pending";
+  const busy = ui.busy || pending || ui.state?.training?.state !== "idle" || ui.state?.pending_delete != null;
+  const draft = ui.configDraft || ui.state?.config || {class_limit: 8, demo_target: 3};
+  $("#config-class-limit").value = draft.class_limit;
+  $("#config-demo-target").value = draft.demo_target;
+  $("#config-class-limit").disabled = $("#config-demo-target").disabled = !writable || busy;
+  $("#config-save").disabled = !writable || busy || !ui.configDirty;
+  $("#config-save-status").textContent = !isConnected() ? "等待设备同步"
+    : !writable ? "网页修改配置需要 r8 固件"
+    : pending ? "正在保存到板载 Flash…"
+    : ui.configDirty ? "修改未保存"
+    : ui.state.config_write?.message || "配置已同步";
+  for (const row of $$("#slot-rows tr")) {
+    const index = Number(row.dataset.slot) - 1;
+    const input = row.querySelector(".slot-color-input");
+    input.disabled = !writable || busy;
+    input.value = ui.configDraft?.colors[index] || ui.state?.slots[index]?.color || slotColors[index];
+    input.title = `RGB ${input.value.toUpperCase()}`;
+  }
+}
+
 function applyState(state) {
   if (!state || typeof state !== "object") return;
   const hadState = ui.state !== null;
@@ -267,8 +311,42 @@ function applyState(state) {
   if (ui.state && state.connection?.epoch !== ui.state.connection?.epoch) {
     ui.lastRecognition = null;
     ui.lastWave = null;
+    ui.configDraft = null;
+    ui.configDirty = ui.configSaving = false;
+  }
+  if (ui.configSaving && state.config_write?.state === "saved") {
+    ui.configDraft = null;
+    ui.configDirty = ui.configSaving = false;
+    toast("配置已保存到板子");
+  } else if (ui.configSaving && state.config_write?.state === "failed") {
+    ui.configSaving = false;
+    toast(state.config_write.message, true);
+  }
+  const samePenEpoch =
+    ui.state &&
+    state.pen_epoch === ui.state.pen_epoch &&
+    state.connection?.epoch === ui.state.connection?.epoch &&
+    state.server_instance === ui.state.server_instance;
+  const corrections = new Map(
+    (samePenEpoch ? ui.state.pen_corrections || [] : []).map((item) => [
+      item.stroke_id,
+      item,
+    ]),
+  );
+  for (const item of state.pen_corrections || [])
+    corrections.set(item.stroke_id, item);
+  state.pen_corrections = [...corrections.values()].slice(-8);
+  if (!samePenEpoch) ui.penCorrectionCursor = 0;
+  if (Number.isSafeInteger(state.pen_correction_cursor)) {
+    ui.penCorrectionCursor = Math.max(
+      ui.penCorrectionCursor,
+      state.pen_correction_cursor,
+    );
   }
   ui.state = state;
+  if (slotById(ui.selected)?.enabled === false) {
+    ui.selected = state.slots.find((slot) => slot.enabled !== false)?.id || 1;
+  }
   ui.serverError = "";
   const freshEvents = (state.events || []).filter(
     (event) => Number(event.seq) > ui.cursor,
@@ -325,6 +403,8 @@ function renderState() {
   const status = state.status || {};
   const training = state.training || { state: "idle" };
   const trainingActive = ["recording", "ready"].includes(training.state);
+  const autonomous = autonomousRecognition();
+  const classLimit = Number(state.config?.class_limit) || 8;
   const pending =
     state.pending_delete !== null && state.pending_delete !== undefined;
   $("#connection-dot").classList.toggle("connected", connected);
@@ -358,11 +438,14 @@ function renderState() {
           "未连接设备";
   $("#armed-toggle").checked = connected && Boolean(status.armed);
   $("#armed-toggle").disabled =
+    autonomous ||
     !connected ||
     ui.busy ||
     trainingActive ||
     pending ||
     (!status.armed && !status.classes);
+  $("#armed-toggle").title = autonomous ? "板端自动控制识别" : "启用动作识别";
+  $("#armed-label").textContent = autonomous ? "板端自动识别" : "动作识别";
   $("#hotkeys-toggle").checked = Boolean(state.hotkeys_enabled);
   $("#hotkeys-toggle").disabled = !connected || ui.busy || demo;
   $("#hotkeys-toggle").title = demo
@@ -390,13 +473,23 @@ function renderState() {
   $("#firmware-version").textContent = connected
     ? `固件：${firmware || "未返回版本"}`
     : "固件版本未读取";
-  const missingCapabilities = [
-    "NO_CALIBRATION",
-    "RANDOM_START",
-    "LIVE_MATCH",
-    "ONE_DEMO",
-    "SIMILARITY_WARNING",
-  ].filter((capability) => !hasCapability(capability));
+  const missingCapabilities = (
+    autonomous
+      ? [
+          "KEY_CAPTURE",
+          "NO_CALIBRATION",
+          "LIVE_MATCH",
+          "RAW_KEY",
+          "DEVICE_CONFIG",
+        ]
+      : [
+          "NO_CALIBRATION",
+          "RANDOM_START",
+          "LIVE_MATCH",
+          "ONE_DEMO",
+          "SIMILARITY_WARNING",
+        ]
+  ).filter((capability) => !hasCapability(capability));
   const firmwareWarning =
     connected &&
     !demo &&
@@ -410,7 +503,8 @@ function renderState() {
       ? `当前固件 ${firmware} 未报告完整的新录制能力。请烧录 gesture-20261005-r4 固件并重新连接。`
       : "板端未返回固件版本，尚不能确认支持随机起始姿态和单次录制。请烧录 gesture-20261005-r4 固件并重新连接。";
   $("#metric-classes").innerHTML =
-    `${connected ? numberText(status.classes) : "—"}<small> / 8</small>`;
+    `${connected ? numberText(status.classes) : "—"}<small> / ${classLimit}</small>`;
+  $("#slot-limit-badge").textContent = String(classLimit);
   $("#metric-armed").textContent = !connected
     ? "等待连接"
     : trainingActive
@@ -432,13 +526,20 @@ function renderState() {
   $("#metric-latency").innerHTML =
     `${connected ? numberText(status.max_feed_us) : "—"}<small> μs</small>`;
   const liveMatch = state.live_match || {};
-  const visibleMatch = liveMatch.id ? liveMatch : state.recent_match || {};
+  const visibleMatch = autonomous
+    ? state.recent_match || {}
+    : liveMatch.id
+      ? liveMatch
+      : state.recent_match || {};
   const candidate =
     connected && status.armed && hasCapability("LIVE_MATCH")
       ? Number(visibleMatch.id) || 0
       : 0;
-  $("#live-match-label").textContent =
-    candidate && !liveMatch.id ? "刚刚匹配 · RGB" : "运动中匹配 · RGB";
+  $("#live-match-label").textContent = autonomous
+    ? "确认识别 · RGB"
+    : candidate && !liveMatch.id
+      ? "刚刚匹配 · RGB"
+      : "运动中匹配 · RGB";
   $("#live-match-color").hidden = !candidate;
   if (candidate) renderSwatch($("#live-match-color"), slotById(candidate));
   $("#live-match-name").textContent = !connected
@@ -455,17 +556,20 @@ function renderState() {
       ? `距离 ${visibleMatch.distance.toFixed(3)}`
       : "";
   const slots = state.slots || blankSlots();
-  const unknownSlots = slots.some((slot) => slot.state === "unknown");
+  const unknownSlots = slots.some(
+    (slot) => slot.enabled !== false && slot.state === "unknown",
+  );
   $("#library-note").textContent = !connected
     ? "等待设备同步"
     : unknownSlots
       ? "固件未提供槽位状态"
-      : `${status.classes || 0} 个动作已保存`;
+      : `${status.classes || 0} 个动作已保存${state.config?.reported ? ` · 启用 ${classLimit} 槽 · 目标 ${state.config.demo_target} 段` : ""}`;
   for (const row of $$("#slot-rows tr")) {
     const slot =
       slots.find((item) => Number(item.id) === Number(row.dataset.slot)) ||
       blankSlots()[Number(row.dataset.slot) - 1];
     row.classList.toggle("selected", Number(slot.id) === ui.selected);
+    row.hidden = slot.enabled === false;
     renderSwatch(row.querySelector(".color-swatch"), slot);
     const nameInput = row.querySelector(".name-input");
     const hotkeyInput = row.querySelector(".hotkey-input");
@@ -490,15 +594,18 @@ function renderState() {
       trainingActive ||
       pending ||
       !supportsManualTraining() ||
+      slot.enabled === false ||
       slot.state !== "empty";
     row.querySelector(".delete-button").disabled =
       !connected ||
       ui.busy ||
       trainingActive ||
       pending ||
+      slot.enabled === false ||
       slot.state !== "saved";
   }
   renderTraining();
+  renderBoardConfig();
   $("#delete-confirm").disabled =
     ui.busy || Number(state.pending_delete) !== ui.deleteSlot || !connected;
   $("#delete-wait").textContent =
@@ -548,7 +655,11 @@ function renderTraining() {
   const active = ["recording", "ready"].includes(training.state);
   const selectedActive = active && Number(training.slot) === ui.selected;
   const ready = selectedActive && training.state === "ready";
-  const oneDemo = hasCapability("ONE_DEMO");
+  const autonomous = autonomousRecognition();
+  const oneDemo = hasCapability("ONE_DEMO") && !autonomous;
+  const target = ui.state?.config?.reported
+    ? ui.state.config.demo_target
+    : Number(training.required) || 3;
   const capturing = selectedActive && Boolean(training.capturing);
   const count = selectedActive
     ? Math.min(3, Number(training.collected) || 0)
@@ -566,7 +677,9 @@ function renderTraining() {
       : capturing
         ? "正在录制，松开 KEY 结束"
         : ready
-          ? "可保存动作"
+          ? autonomous
+            ? "等待板端保存"
+            : "可保存动作"
           : selectedActive
             ? "等待按下 KEY"
             : slot.state === "saved"
@@ -577,7 +690,7 @@ function renderTraining() {
   $("#training-count").textContent = String(count);
   $("#training-count-label").textContent = oneDemo
     ? " 段示范 · 最多 3 段"
-    : " / 3 次示范";
+    : ` / ${target} 次示范`;
   $("#training-template-count").textContent =
     slot.state === "unknown" ? "未同步" : `${slot.templates || 0} 个`;
   $("#training-calibration").textContent = !connected
@@ -588,6 +701,7 @@ function renderTraining() {
         ? "未校准（可选）"
         : "未校准（旧固件）";
   $$(".sample-step").forEach((element, index) => {
+    element.hidden = !oneDemo && index >= target;
     element.querySelector("small").textContent = oneDemo
       ? ["示范", "补充（可选）", "补充（可选）"][index]
       : ["示范一", "示范二", "示范三"][index];
@@ -608,7 +722,9 @@ function renderTraining() {
             : ready
               ? oneDemo && count < 3
                 ? "已可保存，也可继续补充示范"
-                : "示范已完成，可以保存"
+                : autonomous
+                  ? "示范已完成，板端自动保存"
+                  : "示范已完成，可以保存"
               : `第 ${count + 1} 次示范尚未开始`)
         : slot.state === "saved"
           ? "动作已可用于识别"
@@ -627,6 +743,7 @@ function renderTraining() {
     active ||
     ui.state?.pending_delete != null ||
     slot.state !== "empty" ||
+    slot.enabled === false ||
     !manualTraining;
   const demoButton = $("#demo-key-button");
   demoButton.hidden = !connected || !isDemo();
@@ -646,6 +763,7 @@ function renderTraining() {
     ui.demoKeyPressed || capturing ? "松开结束 · 演示" : "按住录制 · 演示";
   $("#save-button").disabled =
     !connected || ui.busy || !ready || capturing || ui.demoKeyPressed;
+  $("#save-label").textContent = autonomous ? "重试保存" : "保存动作";
   $("#cancel-button").disabled = !connected || ui.busy || !active;
 }
 
@@ -656,17 +774,19 @@ function similarityMessage(warning) {
 function trainingMessage(message) {
   const reasons = {
     INCONSISTENT: "动作差异较大，本次示范未计入",
-    CONFLICT: hasCapability("SIMILARITY_WARNING")
-      ? "槽位已被占用，请选择空槽位"
-      : "当前固件拒绝了相似动作；r4 固件可保留示范并提示相似槽位",
+    CONFLICT:
+      hasCapability("SIMILARITY_WARNING") || autonomousRecognition()
+        ? "槽位已被占用，请选择空槽位"
+        : "当前固件拒绝了相似动作；r4 固件可保留示范并提示相似槽位",
     "TOO SHORT": "录制时间过短，本次示范未计入",
     "TOO LONG": "录制时间过长，本次示范未计入",
     QUALITY: "有效运动不足或动作质量不合格，本次示范未计入",
     "LOW QUALITY": "有效运动不足或动作质量不合格，本次示范未计入",
     "SAMPLE GAP": "采样发生中断，本次示范未计入",
-    "NOT READY": hasCapability("RANDOM_START")
-      ? "板端未收到有效采样，本次示范未计入"
-      : "旧固件仍要求起始静止，请烧录 gesture-20261005-r4 后重试",
+    "NOT READY":
+      hasCapability("RANDOM_START") || autonomousRecognition()
+        ? "板端未收到有效采样，本次示范未计入"
+        : "旧固件仍要求起始静止，请烧录 gesture-20261005-r4 后重试",
   };
   const fields = String(message).toUpperCase().split(",");
   for (const field of fields.reverse()) {
@@ -1107,6 +1227,25 @@ async function refreshCaptures() {
 }
 
 function bindEvents() {
+  for (const [selector, field] of [["#config-class-limit", "class_limit"], ["#config-demo-target", "demo_target"]]) {
+    $(selector).addEventListener("change", event => {
+      configDraft()[field] = Number(event.target.value);
+      ui.configDirty = true;
+      renderState();
+    });
+  }
+  $("#config-save").addEventListener("click", () => perform(async () => {
+    ui.configSubmitting = true;
+    try {
+      await api("/api/board/config", configDraft());
+      ui.configSaving = true;
+      if (ui.state?.config_write?.state === "saved") {
+        ui.configDraft = null;
+        ui.configDirty = ui.configSaving = false;
+        toast("配置已保存到板子");
+      }
+    } finally { ui.configSubmitting = false; }
+  }));
   $("#pose-origin-button").addEventListener("click", () =>
     perform(async () => {
       await api("/api/pose/reset", {});
@@ -1249,7 +1388,11 @@ async function poll() {
   ui.lastPollAt = now;
   ui.polling = true;
   try {
-    applyState(await api(`/api/state?after=${ui.cursor}`));
+    applyState(
+      await api(
+        `/api/state?after=${ui.cursor}&pen_after=${ui.penCorrectionCursor}`,
+      ),
+    );
   } catch (error) {
     ui.serverError = `本地服务连接失败：${error.message}`;
     renderState();
