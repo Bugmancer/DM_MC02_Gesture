@@ -121,6 +121,7 @@ class ControllerTests(unittest.TestCase):
         until(lambda: any(data.startswith(b"configure 2 3 ") for data in self.serial.writes))
         wire = next(data for data in self.serial.writes if data.startswith(b"configure "))
         self.assertLess(len(wire), 80)
+        self.assertEqual(len(wire.split()), 11, "r8 accepts the original command without a timing argument")
         with self.assertRaises(ValueError):
             self.controller.configure_board(payload)
         self.controller._process_line("CONFIG,2,3")
@@ -132,19 +133,46 @@ class ControllerTests(unittest.TestCase):
         self.controller.configure_board(payload)
         self.controller._process_line("CONFIG_RESULT,FAILED")
         self.assertEqual(self.controller.snapshot()["config_write"]["state"], "failed")
+        with self.assertRaisesRegex(ValueError, "r9"):
+            self.controller.configure_board({**payload, "rgb_hold_ms": 5000})
         for update in ({"class_limit": 9}, {"demo_target": 0}, {"colors": ["#xxxxxx"] * 8}, {"colors": []}):
             with self.assertRaises(ValueError):
                 self.controller.configure_board({**payload, **update})
 
+    def test_r9_timing_write_requires_ack_and_valid_duration(self):
+        self.connect_real()
+        self.controller._process_line("FIRMWARE,gesture-20261006-r9,AUTO_RECOGNITION,GUI_CONFIG,RGB_TIMING")
+        self.controller._process_line("TIMING,4600")
+        payload = {"class_limit": 8, "demo_target": 3, "colors": ["#123456"] * 8,
+                   "rgb_hold_ms": 30000}
+        for duration in (0, 99, 150, 30001, True, 3.5, None):
+            with self.subTest(duration=duration), self.assertRaises(ValueError):
+                self.controller.configure_board({**payload, "rgb_hold_ms": duration})
+        self.controller.configure_board(payload)
+        until(lambda: any(data.startswith(b"configure ") for data in self.serial.writes))
+        wire = next(data for data in self.serial.writes if data.startswith(b"configure "))
+        self.assertEqual(len(wire), 76)
+        self.assertTrue(wire.endswith(b" 30000\n"))
+        self.assertEqual(self.controller.snapshot()["config"]["rgb_hold_ms"], 4600)
+        self.controller._process_line("TIMING,30000")
+        self.controller._process_line("CONFIG_RESULT,SAVED")
+        self.assertEqual(self.controller.snapshot()["config"]["rgb_hold_ms"], 30000)
+        self.assertEqual(self.controller.snapshot()["config_write"]["state"], "saved")
+
     def test_demo_config_writes_change_live_state_and_disable_high_slots(self):
         self.controller.connect(demo=True)
         until(lambda: self.controller.snapshot()["protocol"]["inventory"])
-        self.controller.configure_board({"class_limit": 1, "demo_target": 2, "colors": ["#8040ff"] * 8})
+        self.controller.configure_board({"class_limit": 1, "demo_target": 2, "colors": ["#8040ff"] * 8,
+                                         "rgb_hold_ms": 4600})
         result = until(lambda: self.controller.snapshot() if self.controller.snapshot()["config_write"]["state"] == "saved" else None)
         self.assertEqual(result["config"]["class_limit"], 1)
         self.assertEqual(result["training"]["required"], 2)
         self.assertFalse(result["slots"][1]["enabled"])
         self.assertEqual(result["slots"][0]["color"], "#8040ff")
+        self.assertEqual(result["config"]["rgb_hold_ms"], 4600)
+        self.controller.command("list")
+        until(lambda: self.controller._commands.empty())
+        self.assertEqual(self.controller.snapshot()["config"]["rgb_hold_ms"], 4600)
 
     def test_r7_config_colors_and_auto_state_do_not_change_host_keyboard_permission(self):
         self.connect_real()
@@ -153,7 +181,8 @@ class ControllerTests(unittest.TestCase):
         self.controller._process_line("COLOR,1,18000A")
         self.controller._process_line("SLOT,3,2,Preserved")
         state = self.controller.snapshot()
-        self.assertEqual(state["config"], {"class_limit": 2, "demo_target": 3, "reported": True})
+        self.assertEqual(state["config"], {"class_limit": 2, "demo_target": 3, "reported": True,
+                                           "rgb_hold_ms": 3000, "timing_reported": False})
         self.assertEqual(state["training"]["required"], 3, "CONFIG target overrides compatibility ONE_DEMO")
         self.assertEqual(state["slots"][0]["color"], "#18000a")
         self.assertTrue(state["slots"][1]["enabled"])
@@ -180,6 +209,27 @@ class ControllerTests(unittest.TestCase):
         self.controller._process_line("EVENT,1200,2,100000,600000,400")
         self.assertEqual(self.controller.snapshot()["recent_match"]["id"], 2)
         self.assertEqual(self.keyboard.keys, [])
+
+    def test_r9_confirmed_rgb_uses_reported_duration_and_candidate_does_not_restart_it(self):
+        self.connect_real()
+        self.controller._process_line("FIRMWARE,gesture-20261006-r9,AUTO_RECOGNITION,RGB_TIMING")
+        self.controller._process_line("TIMING,4600")
+        self.controller._process_line("MATCH,1100,1,100000,600000,400")
+        self.assertIsNone(self.controller.snapshot()["recent_match"], "Candidates do not light the confirmed RGB indicator")
+        self.controller._process_line("EVENT,1200,1,100000,600000,400")
+        confirmed_at = self.controller._last_confident_match
+        self.controller._process_line("MATCH,1220,2,110000,500000,200")
+        self.controller._process_line("UNKNOWN,1240,DISTANCE")
+        self.assertEqual(self.controller._last_confident_match, confirmed_at)
+        self.controller._last_confident_match -= 4.5
+        self.assertEqual(self.controller.snapshot()["recent_match"]["id"], 1)
+        self.controller._last_confident_match -= .2
+        self.assertIsNone(self.controller.snapshot()["recent_match"])
+        self.controller._process_line("EVENT,1400,2,100000,600000,400")
+        self.assertEqual(self.controller.snapshot()["recent_match"]["id"], 2)
+        self.controller._process_line("TIMING,100")
+        self.controller._last_confident_match -= .11
+        self.assertIsNone(self.controller.snapshot()["recent_match"])
 
     def test_pen_correction_cursor_filters_completed_geometry_for_each_client(self):
         for seq, down in enumerate((0, 1, 1, 0, 1, 1, 0), start=1):

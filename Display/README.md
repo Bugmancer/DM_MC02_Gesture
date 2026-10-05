@@ -21,9 +21,10 @@ uppercase. `power_ok` means the application's power-enable state, not a measured
 supply voltage. Use the message for acquisition or storage error details.
 
 `class_limit` restricts the visible slots (1-8). `settings_open` selects the
-on-device configuration view; `settings_row` selects one of eight rows: action
-count, demonstrations, color slot, red, green, blue, save, cancel. The view
-uses `config_demos`, zero-based `config_slot`, and `slot_colors` in 0xRRGGBB.
+on-device configuration view; `settings_row` selects one of nine rows: action
+count, demonstrations, RGB hold time, color slot, red, green, blue, save, cancel.
+The view uses `config_demos`, `config_rgb_hold_ms`, zero-based `config_slot`, and
+`slot_colors` in 0xRRGGBB. Hold time displays tenths of a second (0.1-30.0 s).
 These fields display the application's working draft; Flash writes and cancel
 semantics belong to the application. Normal UP enters settings; it no longer
 toggles recognition.

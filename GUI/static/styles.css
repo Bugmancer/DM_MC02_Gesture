@@ -491,6 +491,8 @@ h3 {
 }
 .device-config label { display: flex; align-items: center; gap: 8px; font-size: 12px; }
 .device-config select { width: 64px; padding: 7px; border: 1px solid var(--line); border-radius: 4px; background: white; }
+.device-config input[type="number"] { width: 74px; padding: 7px; border: 1px solid var(--line); border-radius: 4px; background: white; }
+.device-config input[type="number"]:disabled { opacity: .55; }
 .device-config [role="status"] { font-size: 11px; overflow-wrap: anywhere; }
 .slot-color-input { width: 34px; height: 28px; padding: 2px; border: 1px solid var(--line); border-radius: 4px; background: white; cursor: pointer; }
 .slot-color-input:disabled { cursor: default; opacity: .55; }

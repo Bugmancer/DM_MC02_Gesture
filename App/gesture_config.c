@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-#define GC_VERSION 1u
+#define GC_VERSION 2u
 #define GC_MODEL_LENGTH_OFFSET (20u + 4u * GE_MAX_CLASSES)
 
 static uint16_t read_u16(const uint8_t *p)
@@ -53,6 +53,7 @@ void gc_defaults(gesture_config_t *config)
     memset(config, 0, sizeof(*config));
     config->class_limit = GE_MAX_CLASSES;
     config->demo_target = 1u;
+    config->rgb_hold_ms = 3000u;
     memcpy(config->colors, colors, sizeof(colors));
 }
 
@@ -60,7 +61,10 @@ ge_status_t gc_validate(const gesture_config_t *config)
 {
     uint8_t id;
     if (!config || config->class_limit == 0u || config->class_limit > GE_MAX_CLASSES ||
-        config->demo_target == 0u || config->demo_target > GE_TEMPLATES_PER_CLASS)
+        config->demo_target == 0u || config->demo_target > GE_TEMPLATES_PER_CLASS ||
+        config->rgb_hold_ms < GC_RGB_HOLD_MIN_MS ||
+        config->rgb_hold_ms > GC_RGB_HOLD_MAX_MS ||
+        config->rgb_hold_ms % GC_RGB_HOLD_STEP_MS != 0u)
         return GE_ERR_ARGUMENT;
     for (id = 0u; id < GE_MAX_CLASSES; ++id)
         if (config->colors[id] > 0xffffffu) return GE_ERR_ARGUMENT;
@@ -84,6 +88,7 @@ size_t gc_export(const gesture_config_t *config, const ge_engine_t *engine,
     write_u32(buffer + 8u, (uint32_t)length);
     buffer[16] = config->class_limit;
     buffer[17] = config->demo_target;
+    write_u16(buffer + 18u, config->rgb_hold_ms);
     for (id = 0u; id < GE_MAX_CLASSES; ++id)
         write_u32(buffer + 20u + 4u * id, config->colors[id]);
     write_u32(buffer + GC_MODEL_LENGTH_OFFSET, (uint32_t)model_length);
@@ -98,6 +103,7 @@ ge_status_t gc_import(gesture_config_t *config, ge_engine_t *engine,
     ge_status_t status;
     const uint8_t *model;
     size_t model_length;
+    uint16_t version;
     uint8_t id;
     if (!config || !engine || !buffer) return GE_ERR_ARGUMENT;
     if (length < 4u || length > GC_BLOB_MAX) return GE_ERR_FORMAT;
@@ -107,11 +113,16 @@ ge_status_t gc_import(gesture_config_t *config, ge_engine_t *engine,
         model_length = length;
     } else {
         if (length < GC_HEADER_BYTES || memcmp(buffer, "GCF1", 4u) ||
-            read_u16(buffer + 4u) != GC_VERSION ||
             read_u16(buffer + 6u) != GC_HEADER_BYTES ||
             read_u32(buffer + 8u) != length) return GE_ERR_FORMAT;
+        version = read_u16(buffer + 4u);
+        if (version != 1u && version != GC_VERSION) return GE_ERR_FORMAT;
         if (read_u32(buffer + 12u) != config_crc(buffer, length)) return GE_ERR_CRC;
-        if (read_u16(buffer + 18u) != 0u) return GE_ERR_FORMAT;
+        if (version == 1u) {
+            if (read_u16(buffer + 18u) != 0u) return GE_ERR_FORMAT;
+        } else {
+            candidate.rgb_hold_ms = read_u16(buffer + 18u);
+        }
         candidate.class_limit = buffer[16];
         candidate.demo_target = buffer[17];
         for (id = 0u; id < GE_MAX_CLASSES; ++id)

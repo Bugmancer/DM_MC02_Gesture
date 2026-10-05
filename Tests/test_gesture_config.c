@@ -9,6 +9,12 @@ static gesture_config_t config, loaded, config_before;
 static uint8_t blob[GC_BLOB_MAX], corrupted[GC_BLOB_MAX];
 static uint8_t legacy[GE_MODEL_BLOB_MAX], exported[GE_MODEL_BLOB_MAX];
 
+static void write_u16(uint8_t *p, uint16_t value)
+{
+    p[0] = (uint8_t)value;
+    p[1] = (uint8_t)(value >> 8);
+}
+
 static void write_u32(uint8_t *p, uint32_t value)
 {
     p[0] = (uint8_t)value;
@@ -58,6 +64,7 @@ static void test_defaults_and_limits(void)
     gc_defaults(NULL);
     gc_defaults(&config);
     assert(config.class_limit == 8u && config.demo_target == 1u);
+    assert(config.rgb_hold_ms == 3000u);
     assert(config.colors[0] == 0x180000u && config.colors[7] == 0x181818u);
     assert(gc_validate(NULL) == GE_ERR_ARGUMENT);
     for (limit = 1u; limit <= GE_MAX_CLASSES; ++limit)
@@ -80,6 +87,19 @@ static void test_defaults_and_limits(void)
         config.colors[id] = 0x1000000u;
         assert(gc_validate(&config) == GE_ERR_ARGUMENT);
     }
+    gc_defaults(&config);
+    for (limit = GC_RGB_HOLD_MIN_MS; limit <= GC_RGB_HOLD_MAX_MS;
+         limit += GC_RGB_HOLD_STEP_MS) {
+        config.rgb_hold_ms = (uint16_t)limit;
+        assert(gc_validate(&config) == GE_OK);
+    }
+    {
+        static const uint16_t invalid[] = {0u, 99u, 101u, 29999u, 30001u, 65535u};
+        for (id = 0u; id < sizeof(invalid) / sizeof(invalid[0]); ++id) {
+            config.rgb_hold_ms = invalid[id];
+            assert(gc_validate(&config) == GE_ERR_ARGUMENT);
+        }
+    }
 }
 
 static void test_roundtrip_preserves_hidden_models(void)
@@ -96,6 +116,7 @@ static void test_roundtrip_preserves_hidden_models(void)
             gc_defaults(&config);
             config.class_limit = (uint8_t)limit;
             config.demo_target = (uint8_t)demos;
+            config.rgb_hold_ms = (uint16_t)(limit * demos * 100u);
             for (id = 0u; id < GE_MAX_CLASSES; ++id)
                 config.colors[id] = (id * 31u << 16) | ((255u - id * 17u) << 8) | (id * 29u);
             config.colors[0] = 0u;
@@ -103,6 +124,9 @@ static void test_roundtrip_preserves_hidden_models(void)
             length = gc_export(&config, &source, blob, sizeof(blob));
             assert(length == legacy_length + GC_HEADER_BYTES);
             assert(length <= GC_BLOB_MAX && !memcmp(blob, "GCF1", 4u));
+            assert(blob[4] == 2u && blob[5] == 0u);
+            assert(blob[18] == (uint8_t)config.rgb_hold_ms);
+            assert(blob[19] == (uint8_t)(config.rgb_hold_ms >> 8));
             ge_init(&destination);
             gc_defaults(&loaded);
             assert(gc_import(&loaded, &destination, blob, length) == GE_OK);
@@ -123,12 +147,52 @@ static void test_roundtrip_preserves_hidden_models(void)
     assert(gc_export(&config, NULL, blob, sizeof(blob)) == 0u);
 }
 
+static void test_hold_time_roundtrip_and_legacy_envelope(void)
+{
+    size_t length, model_length;
+    unsigned i;
+    static const uint16_t durations[] = {100u, 3000u, 30000u};
+    model_length = ge_model_export(&source, legacy, sizeof(legacy));
+    gc_defaults(&config);
+    config.class_limit = 2u;
+    config.demo_target = 3u;
+    config.colors[0] = 0xabcdefu;
+    config.colors[7] = 0x123456u;
+    for (i = 0u; i < sizeof(durations) / sizeof(durations[0]); ++i) {
+        config.rgb_hold_ms = durations[i];
+        length = gc_export(&config, &source, blob, sizeof(blob));
+        assert(length == model_length + GC_HEADER_BYTES);
+        assert(gc_import(&loaded, &destination, blob, length) == GE_OK);
+        assert(!memcmp(&loaded, &config, sizeof(config)));
+        assert(ge_model_export(&destination, exported, sizeof(exported)) == model_length);
+        assert(!memcmp(exported, legacy, model_length));
+    }
+    memcpy(corrupted, blob, length);
+    write_u16(corrupted + 4u, 1u);
+    write_u16(corrupted + 18u, 0u);
+    repair_crc(corrupted, length);
+    assert(gc_import(&loaded, &destination, corrupted, length) == GE_OK);
+    config.rgb_hold_ms = 3000u;
+    assert(!memcmp(&loaded, &config, sizeof(config)));
+    assert(ge_class_count(&destination) == 2u && ge_active_class_count(&destination) == 1u);
+    assert(!strcmp(ge_class_get(&destination, 7u)->name, "EIGHTH"));
+    assert(ge_model_export(&destination, exported, sizeof(exported)) == model_length);
+    assert(!memcmp(exported, legacy, model_length));
+    length = gc_export(&loaded, &destination, blob, sizeof(blob));
+    assert(blob[4] == 2u && blob[18] == 0xb8u && blob[19] == 0x0bu);
+    assert(gc_import(&loaded, &destination, blob, length) == GE_OK);
+    write_u16(corrupted + 18u, 100u);
+    repair_crc(corrupted, length);
+    assert_failed_unchanged(corrupted, length, GE_ERR_FORMAT);
+}
+
 static void test_legacy_import_uses_defaults_without_migration_loss(void)
 {
     size_t length = ge_model_export(&source, legacy, sizeof(legacy));
     gc_defaults(&loaded);
     loaded.class_limit = 2u;
     loaded.demo_target = 3u;
+    loaded.rgb_hold_ms = 30000u;
     loaded.colors[7] = 0x123456u;
     assert(ge_set_class_limit(&destination, 2u) == GE_OK);
     assert(gc_import(&loaded, &destination, legacy, length) == GE_OK);
@@ -167,9 +231,18 @@ static void test_corruption_and_invalid_settings_are_atomic(void)
     repair_crc(corrupted, length);
     assert_failed_unchanged(corrupted, length, GE_ERR_CRC);
     memcpy(corrupted, blob, length);
-    corrupted[4] = 2u;
+    corrupted[4] = 3u;
     repair_crc(corrupted, length);
     assert_failed_unchanged(corrupted, length, GE_ERR_FORMAT);
+    {
+        static const uint16_t invalid[] = {0u, 99u, 101u, 29999u, 30001u, 65535u};
+        for (i = 0u; i < sizeof(invalid) / sizeof(invalid[0]); ++i) {
+            memcpy(corrupted, blob, length);
+            write_u16(corrupted + 18u, invalid[i]);
+            repair_crc(corrupted, length);
+            assert_failed_unchanged(corrupted, length, GE_ERR_FORMAT);
+        }
+    }
     memcpy(corrupted, blob, length);
     write_u32(corrupted + GC_HEADER_BYTES - 4u, (uint32_t)length);
     repair_crc(corrupted, length);
@@ -190,6 +263,7 @@ int main(void)
 {
     test_defaults_and_limits();
     test_roundtrip_preserves_hidden_models();
+    test_hold_time_roundtrip_and_legacy_envelope();
     test_legacy_import_uses_defaults_without_migration_loss();
     test_corruption_and_invalid_settings_are_atomic();
     puts("All gesture configuration tests passed.");

@@ -94,8 +94,9 @@ static void reset_app(void)
     timer_running = 0; timer_start_result = HAL_OK; reset_runtime();
     assert(armed && engine.recognizing && timer_running && !calibrated);
     assert(calibration_calls == 0U && config.class_limit == 8U && config.demo_target == 1U);
-    assert(strstr(log_history, "gesture-20261006-r8"));
+    assert(strstr(log_history, "gesture-20261006-r9"));
     assert(strstr(log_history, "RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG"));
+    assert(config.rgb_hold_ms == 3000U && strstr(log_history, "RGB_TIMING"));
     assert(max_log_length < 192U); clear_logs();
 }
 static void fixture_class(uint8_t slot)
@@ -205,18 +206,21 @@ static void test_settings_edit_save_reboot_and_hidden_slots(void)
     assert(settings_open && !armed && view.settings_open);
     for (i = 0U; i < 4U; ++i) key_event(BOARD_KEY_LEFT);
     settings_select(1U); key_event(BOARD_KEY_RIGHT); key_event(BOARD_KEY_RIGHT);
-    settings_select(2U); key_event(BOARD_KEY_RIGHT);
-    settings_select(3U); key_event(BOARD_KEY_RIGHT); key_event(BOARD_KEY_RIGHT);
-    settings_select(4U); key_event(BOARD_KEY_RIGHT);
-    settings_select(5U); key_event(BOARD_KEY_RIGHT); key_event(BOARD_KEY_OK);
+    settings_select(2U); key_event(BOARD_KEY_RIGHT); key_event(BOARD_KEY_RIGHT);
+    assert(config_draft.rgb_hold_ms == 3200U && view.config_rgb_hold_ms == 3200U);
+    settings_select(3U); key_event(BOARD_KEY_RIGHT);
+    settings_select(4U); key_event(BOARD_KEY_RIGHT); key_event(BOARD_KEY_RIGHT);
+    settings_select(5U); key_event(BOARD_KEY_RIGHT);
+    settings_select(6U); key_event(BOARD_KEY_RIGHT); key_event(BOARD_KEY_OK);
     assert(config_draft.colors[1U] == 0x222912U && mock_rgb == 0x222912U);
     assert(config.class_limit == 8U && config.demo_target == 1U);
-    settings_select(6U); key_event(BOARD_KEY_OK);
+    settings_select(7U); key_event(BOARD_KEY_OK);
     assert(!settings_open && armed && timer_running && store_calls == 1U);
     assert(config.class_limit == 4U && config.demo_target == 3U && config.colors[1U] == 0x222912U);
     assert(ge_class_count(&engine) == 2U && ge_active_class_count(&engine) == 1U);
     assert(!memcmp(&hidden, ge_class_get(&engine, 7U), sizeof(hidden)));
     reset_runtime(); assert(armed && config.class_limit == 4U && config.demo_target == 3U);
+    assert(config.rgb_hold_ms == 3200U);
     assert(config.colors[1U] == 0x222912U && ge_class_count(&engine) == 2U);
     assert(!memcmp(&hidden, ge_class_get(&engine, 7U), sizeof(hidden)));
     selected = 3U; key_event(BOARD_KEY_RIGHT); assert(selected == 0U);
@@ -230,14 +234,19 @@ static void test_settings_cancel_bounds_key_and_failed_write(void)
     for (i = 0U; i < 20U; ++i) key_event(BOARD_KEY_LEFT);
     assert(config_draft.class_limit == 1U); settings_select(1U);
     for (i = 0U; i < 8U; ++i) key_event(BOARD_KEY_LEFT);
-    assert(config_draft.demo_target == 1U); settings_select(3U);
+    assert(config_draft.demo_target == 1U); settings_select(2U);
+    for (i = 0U; i < 35U; ++i) key_event(BOARD_KEY_LEFT);
+    assert(config_draft.rgb_hold_ms == GC_RGB_HOLD_MIN_MS);
+    for (i = 0U; i < 310U; ++i) key_event(BOARD_KEY_RIGHT);
+    assert(config_draft.rgb_hold_ms == GC_RGB_HOLD_MAX_MS);
+    settings_select(4U);
     for (i = 0U; i < 20U; ++i) key_event(BOARD_KEY_RIGHT);
     assert((config_draft.colors[0] >> 16) == 255U);
     key_event(BOARD_KEY_OK); assert((config_draft.colors[0] >> 16) == 0U);
     mock_user_down = 1U; user_key_process(mock_tick); assert(!training && !capture_held && !armed);
-    settings_select(6U); store_success = 0; key_event(BOARD_KEY_OK);
+    settings_select(7U); store_success = 0; key_event(BOARD_KEY_OK);
     assert(settings_open && !armed && timer_running && !memcmp(&config, &before, sizeof(config)));
-    assert(strstr(last_log, "ERROR,CONFIG,SAVE_FAILED")); settings_select(7U); key_event(BOARD_KEY_OK);
+    assert(strstr(last_log, "ERROR,CONFIG,SAVE_FAILED")); settings_select(8U); key_event(BOARD_KEY_OK);
     assert(!settings_open && armed && !memcmp(&config, &before, sizeof(config)));
     command("learn 1"); key_event(BOARD_KEY_UP);
     assert(training && !settings_open && !armed && strstr(last_log, "BUSY"));
@@ -255,14 +264,41 @@ static void test_rgb_three_seconds_and_confirmed_replacement(void)
     rgb_event(GE_EVENT_RECOGNIZED, 0U, 0xfffffff0U); update_rgb(0x00000ba7U); assert(mock_rgb == 0x102030U);
     view.state = DISPLAY_STATE_ARMED; update_rgb(0x00000ba8U); assert(mock_rgb == 0x001010U);
 }
-static void test_rgb_preview_is_not_keyboard_event(void)
+static void test_rgb_preview_is_not_an_accepted_indicator(void)
 {
-    reset_app(); rgb_event(GE_EVENT_MATCH, 1U, 1000U); assert(mock_rgb == config.colors[1U] && event_logs == 0U);
-    rgb_event(GE_EVENT_MATCH, GE_CLASS_NONE, 1040U); update_rgb(1199U); assert(mock_rgb == config.colors[1U]);
-    update_rgb(1200U); assert(mock_rgb == 0x001010U); rgb_event(GE_EVENT_UNKNOWN, GE_CLASS_NONE, 1300U);
+    reset_app(); update_rgb(999U);
+    rgb_event(GE_EVENT_MATCH, 1U, 1000U); update_rgb(1000U);
+    assert(mock_rgb == 0x001010U && event_logs == 0U && rgb_match_slot == GE_CLASS_NONE);
+    rgb_event(GE_EVENT_MATCH, GE_CLASS_NONE, 1040U); update_rgb(1199U); assert(mock_rgb == 0x001010U);
+    rgb_event(GE_EVENT_UNKNOWN, GE_CLASS_NONE, 1300U);
     rgb_event(GE_EVENT_MATCH, GE_CLASS_NONE, 1310U); assert(view.state == DISPLAY_STATE_UNKNOWN && mock_rgb == 0x180000U);
     update_rgb(1450U); assert(mock_rgb == 0U); command("learn 1");
     rgb_event(GE_EVENT_RECOGNIZED, 1U, 1500U); assert(event_logs == 0U && training);
+}
+static void test_rgb_configurable_duration_and_idempotent_arm(void)
+{
+    const uint16_t durations[] = {100U, 700U, 5000U, 30000U};
+    unsigned i;
+    for (i = 0U; i < sizeof(durations) / sizeof(durations[0]); ++i) {
+        uint32_t start = i % 2U ? 0xffffff00U : 1000U;
+        uint32_t end = start + durations[i];
+        reset_app(); config.rgb_hold_ms = durations[i]; config.colors[0] = 0x102030U;
+        rgb_event(GE_EVENT_RECOGNIZED, 0U, start);
+        assert(rgb_accepted_until == end && rgb_match_until == end && mock_rgb == 0x102030U);
+        command("arm"); assert(rgb_accepted_until == end && rgb_match_slot == 0U);
+        if (i == 2U) {
+            mock_tick = start + 10U;
+            sample_once(processed_ticks + 2U);
+            assert(sample_drops == 1U && rgb_match_slot == 0U && rgb_accepted_until == end);
+        }
+        rgb_event(GE_EVENT_MATCH, 1U, start + 20U);
+        rgb_event(GE_EVENT_MATCH, GE_CLASS_NONE, start + 30U);
+        rgb_event(GE_EVENT_UNKNOWN, GE_CLASS_NONE, start + 40U);
+        update_rgb(end - 1U); assert(mock_rgb == 0x102030U);
+        view.state = DISPLAY_STATE_ARMED; update_rgb(end); assert(mock_rgb == 0x001010U);
+        rgb_event(GE_EVENT_RECOGNIZED, 1U, end + 1U);
+        assert(mock_rgb == config.colors[1] && rgb_accepted_until == end + 1U + durations[i]);
+    }
 }
 static void test_key_requires_release_and_ignores_unheld_motion(void)
 {
@@ -313,7 +349,7 @@ static void test_timer_failures_and_missing_imu_do_not_arm(void)
     assert(!armed && view.state == DISPLAY_STATE_ERROR);
     reset_app(); command("learn 1"); pending_fixture(); timer_start_result = HAL_ERROR; command("save");
     assert(!armed && view.state == DISPLAY_STATE_ERROR && !(ready_mask & BOARD_READY_IMU));
-    reset_app(); key_event(BOARD_KEY_UP); settings_select(6U); timer_start_result = HAL_ERROR; key_event(BOARD_KEY_OK);
+    reset_app(); key_event(BOARD_KEY_UP); settings_select(7U); timer_start_result = HAL_ERROR; key_event(BOARD_KEY_OK);
     assert(!armed && view.state == DISPLAY_STATE_ERROR && !(ready_mask & BOARD_READY_IMU));
 }
 static void test_inventory_settings_and_log_bounds(void)
@@ -321,6 +357,7 @@ static void test_inventory_settings_and_log_bounds(void)
     unsigned slot; char line[48]; reset_app(); fixture_class(0U); fixture_class(7U);
     memcpy(engine.model.classes[7U].name, "Last,\r\n\xff", 8U); engine.model.classes[7U].name[8U] = '\0'; command("list");
     assert(strstr(log_history, "SLOT,8,3,Last____\r\n") && strstr(log_history, "CONFIG,8,1\r\n"));
+    assert(strstr(log_history, "TIMING,3000\r\n"));
     for (slot = 0U; slot < 8U; ++slot) {
         (void)snprintf(line, sizeof(line), "COLOR,%u,%06lX\r\n", slot + 1U, (unsigned long)config.colors[slot]);
         assert(strstr(log_history, line));
@@ -355,23 +392,32 @@ static void test_gui_config_is_atomic_and_preserves_templates(void)
 {
     unsigned writes;
     reset_app(); fixture_class(7U);
-    command("configure 2 3 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203");
+    command("configure 2 3 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 5000");
     assert(config.class_limit == 2U && config.demo_target == 3U && config.colors[0] == 0x123456U);
     assert(config.colors[7] == 0x010203U && armed && !settings_open);
+    assert(config.rgb_hold_ms == 5000U);
     assert(ge_class_get(&engine, 7U) != NULL && store_calls == 1U);
     assert(strstr(log_history, "CONFIG_RESULT,SAVED"));
     reset_runtime();
     assert(config.colors[0] == 0x123456U && config.demo_target == 3U);
+    assert(config.rgb_hold_ms == 5000U);
     assert(ge_class_get(&engine, 7U) != NULL && armed);
     writes = store_calls;
     command("configure 0 1 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203");
     command("configure 2 1 12345x abcdef 000000 00ff00 ff0000 0000ff ffffff 010203");
+    command("configure 2 1 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 99");
+    command("configure 2 1 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 30001");
+    command("configure 2 1 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 555");
+    command("configure 2 1 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 abc");
+    command("configure 2 1 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 3000 extra");
     assert(store_calls == writes && config.demo_target == 3U);
     store_success = 0;
     command("configure 8 1 000000 000000 000000 000000 000000 000000 000000 000000");
     assert(config.class_limit == 2U && config.colors[0] == 0x123456U && armed && !settings_open);
     assert(strstr(log_history, "CONFIG_RESULT,FAILED"));
     store_success = 1;
+    command("configure 2 3 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203");
+    assert(config.rgb_hold_ms == 5000U && store_calls == writes + 2U);
     command("learn 1"); writes = store_calls;
     command("configure 8 1 000000 000000 000000 000000 000000 000000 000000 000000");
     assert(training && !armed && store_calls == writes && config.class_limit == 2U);
@@ -387,7 +433,8 @@ int main(void)
     test_settings_edit_save_reboot_and_hidden_slots();
     test_settings_cancel_bounds_key_and_failed_write();
     test_rgb_three_seconds_and_confirmed_replacement();
-    test_rgb_preview_is_not_keyboard_event();
+    test_rgb_preview_is_not_an_accepted_indicator();
+    test_rgb_configurable_duration_and_idempotent_arm();
     test_key_requires_release_and_ignores_unheld_motion();
     test_capture_short_long_gap_and_cancel();
     test_save_during_capture_cannot_commit_partial_demo();
@@ -397,6 +444,6 @@ int main(void)
     test_key_timestamp_and_raw_physical_key();
     test_similar_demonstrations_do_not_block_auto_save();
     test_gui_config_is_atomic_and_preserves_templates();
-    puts("Gesture app tests passed (18 autonomous-device scenarios, real engine/config with mocked hardware).");
+    puts("Gesture app tests passed (19 autonomous-device scenarios, real engine/config with mocked hardware).");
     return 0;
 }

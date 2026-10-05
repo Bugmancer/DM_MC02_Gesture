@@ -2,7 +2,7 @@
 
 基于 DM-MC02 / STM32H723VG、BMI088 和 HAL 的板端现场学习动作识别原型。学习、模板匹配、拒绝判定和保存都在板上完成；增加动作无需重新编译或烧录。
 
-上电自动识别，无需电脑或网页开启。学习示范由板载 KEY 按下开始、松开结束，达到设定次数后自动保存并恢复识别。可在板端设置参与识别的动作种类数 1～8、每种动作示范数 1～3 和各动作的 RGB 颜色。识别使用运动过程中的滑动窗口 DTW，不要求先回到固定初始姿态或等待动作结束；确认后灯色保持 3 秒，新确认动作可立即换色。
+上电自动识别，无需电脑或网页开启。学习示范由板载 KEY 按下开始、松开结束，达到设定次数后自动保存并恢复识别。可在板端设置参与识别的动作种类数 1～8、每种动作示范数 1～3、各动作的 RGB 颜色和灯色持续时间 0.1～30 秒（默认 3 秒）。识别使用运动过程中的滑动窗口 DTW，不要求先回到固定初始姿态或等待动作结束；新确认动作可立即换色。
 
 ## 编译与烧录
 
@@ -13,7 +13,7 @@
 - `MDK-ARM/Build/DM_MC02_Gesture.axf`（带调试信息）
 - `MDK-ARM/Build/DM_MC02_Gesture.map`、`build.log`
 
-命令行脚本与 uVision 构建统一输出到 `MDK-ARM/Build`。最新固件 `gesture-20261006-r8` 支持网页修改动作数量、示范次数和每槽 RGB，并保留自动识别、板端设置、3 秒灯色保持和 USB suspend/resume 修复。r8 需要更新固件一次；现有动作模板兼容加载，新设置保存在外部 Flash，之后修改不需重新编译。电脑端空中画笔算法仍兼容 r5。
+命令行脚本与 uVision 构建统一输出到 `MDK-ARM/Build`。最新固件 `gesture-20261006-r9` 支持网页修改动作数量、示范次数、每槽 RGB 和灯色持续时间；修复候选匹配亮同一动作灯但只保持 200 ms 的问题，动作标识灯现在只表示确认识别。r9 需要更新固件一次；现有动作模板及 r8 配置兼容加载，旧配置的持续时间默认为 3 秒。新设置保存在外部 Flash，之后修改不需重新编译。电脑端空中画笔算法仍兼容 r5。
 
 在项目根目录运行：
 
@@ -47,11 +47,11 @@ GUI 的 KEY 录制需要本次 `MDK-ARM/Build/DM_MC02_Gesture.hex` 固件。旧�
 2. 左右选择空动作槽位，OK 开始学习，此时识别暂停。
 3. 按住板载 KEY（PA15）开始一段示范，松开结束；达到设定的 1～3 段后自动保存、自动恢复识别。默认只需一段。
 4. 相似示范仍计入并提示。无效示范可重试，已接受次数保留。DOWN 取消学习并恢复旧动作识别；写入失败保留示范，可按 OK 重试。
-5. UP 打开板端设置。上下选择 `ACTION COUNT`、`DEMOS PER ACTION`、`COLOR FOR ACTION`、`RED/GREEN/BLUE`、保存或取消；左右修改值，RGB 行左右粗调 17、OK 细调 1，可设置完整 0～255。选 `SAVE AND EXIT` 后 OK 保存到 Flash 并恢复识别。
+5. UP 打开板端设置。上下选择 `ACTION COUNT`、`DEMOS PER ACTION`、`RGB HOLD TIME`、`COLOR FOR ACTION`、`RED/GREEN/BLUE`、保存或取消；左右修改值，持续时间以 0.1 秒步进，RGB 行左右粗调 17、OK 细调 1，可设置完整 0～255。选 `SAVE AND EXIT` 后 OK 保存到 Flash 并恢复识别。
 6. 动作种类数可设 1～8，示范数可设 1～3；每槽单独设置 RGB。缩小种类数只停用高编号槽位，扩大后原模板和颜色仍保留。
 7. 已占用槽位按 OK 进入删除确认，再按 OK 删除并自动恢复识别；DOWN 取消。KEY 不用于开启或关闭识别。
 
-网页“动作库”上方可选动作数量和示范次数，每槽 RGB 选择器修改灯色；点击“保存到板子”统一写入 Flash。网页等待板端确认，不将本地草稿当作保存成功。学习或删除确认期间不能修改配置；旧固件需升级到 r8 后才启用这些控件。
+网页“动作库”上方可选动作数量、示范次数和“灯色持续时间”，每槽 RGB 选择器修改灯色；点击“保存到板子”统一写入 Flash。网页等待板端确认，不将本地草稿当作保存成功。学习或删除确认期间不能修改配置；r8 可修改数量和颜色，持续时间控件需要 r9。
 
 屏幕显示状态、槽位模板数、最佳/次佳距离、拒绝和漏采计数。以下是默认颜色，均可在板端逐槽修改，GUI 同步实际配置：
 
@@ -59,9 +59,9 @@ GUI 的 KEY 录制需要本次 `MDK-ARM/Build/DM_MC02_Gesture.hex` 固件。旧�
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | 颜色 | 红 | 绿 | 蓝 | 黄 | 青 | 品红 | 橙 | 白 |
 
-学习等待为暗蓝、按住录制亮当前槽位颜色、待重试保存为黄色、自动识别等待为青色。确认识别的灯色保持 3 秒，期间未确认的预览或陌生动作不会清除它，新确认动作立即换色并重新计时。没有已确认颜色保持时仍可显示实时匹配预览；陌生动作结束后双闪红色，硬件错误持续闪红。温控加热和对外电源输出保持关闭。
+学习等待为暗蓝、按住录制亮当前槽位颜色、待重试保存为黄色、自动识别等待为青色。确认识别的灯色保持设置的时长，期间候选或陌生动作不会清除它，新确认动作立即换色并重新计时。候选仅更新匹配分数，不触发动作标识灯；进入学习/设置或硬件错误可以提前结束保持。陌生动作结束后双闪红色，硬件错误持续闪红。温控加热和对外电源输出保持关闭。
 
-保存和校准会明确暂停采样，完成后使用新的有效 IMU 样本恢复。USB/LCD 不会阻塞等待电脑读取；意外漏采会计数并清除历史窗口，不会补造样本。实时匹配更新 RGB；电脑操作事件单独防重复，持续运动不会连续发送同一串快捷键。
+保存和校准会明确暂停采样，完成后使用新的有效 IMU 样本恢复。USB/LCD 不会阻塞等待电脑读取；意外漏采会计数并清除历史窗口，不会补造样本。确认识别更新 RGB；电脑操作事件单独防重复，持续运动不会连续发送同一串快捷键。
 
 ## 电脑事件与数据采集
 
@@ -103,13 +103,14 @@ python Tools/gesture_host.py --port COM7 --output captures/session01.csv --user 
 | `cancel` | 放弃待确认操作并恢复自动识别 |
 | `calibrate` | 关闭识别后重新静止校准 |
 | `stream 1` / `stream 0` | 开关原始六轴数据输出 |
-| `configure N D RRGGBB ...` | 设置动作数量 N、示范次数 D 和完整 8 槽 RGB；成功返回 `CONFIG_RESULT,SAVED`，失败返回 `CONFIG_RESULT,FAILED` |
+| `configure N D RRGGBB ... H` | 设置动作数量 N、示范次数 D、完整 8 槽 RGB 和持续时间 H（毫秒）；H 可省略以保留当前时长。成功返回 `CONFIG_RESULT,SAVED`，失败返回 `CONFIG_RESULT,FAILED` |
 
 协议 v1：
 
 ```text
 RAW,seq,t_ms,ax_milli,ay_milli,az_milli,gx_milli,gy_milli,gz_milli,key_down
 FIRMWARE,gesture-20261005-r5,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY
+TIMING,3000
 TRAIN,WARN,SIMILAR,existing_slot_1based,distance_micro,limit_micro
 MATCH,t_ms,class_id_or_0,distance_micro,second_distance_micro,duration_ms
 EVENT,t_ms,class_id,distance_micro,second_distance_micro,duration_ms

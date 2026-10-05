@@ -99,6 +99,15 @@ class ProtocolTests(unittest.TestCase):
             with self.subTest(line=line), self.assertRaises(ValueError):
                 host.parse_line(line)
 
+    def test_rgb_hold_timing_bounds_and_step(self):
+        for duration in (100, 3000, 30000):
+            self.assertEqual(host.parse_line(f"TIMING,{duration}"),
+                             {"kind": "TIMING", "rgb_hold_ms": duration})
+        for line in ("TIMING", "TIMING,0", "TIMING,99", "TIMING,30001",
+                     "TIMING,150", "TIMING,NaN", "TIMING,3.0", "TIMING,100,200"):
+            with self.subTest(line=line), self.assertRaises(ValueError):
+                host.parse_line(line)
+
     def test_optional_serial_buffers_are_capability_checked_and_nonfatal(self):
         self.assertIsNone(host.configure_serial_buffers(object()))
         calls = []

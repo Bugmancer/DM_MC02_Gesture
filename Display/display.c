@@ -96,7 +96,7 @@ static uint32_t capped_count(uint32_t count)
 static void compose_settings(void)
 {
     uint8_t slot = current_view.config_slot < 8U ? current_view.config_slot : 0U;
-    uint8_t selected_row = current_view.settings_row < 8U ? current_view.settings_row : 0U;
+    uint8_t selected_row = current_view.settings_row < 9U ? current_view.settings_row : 0U;
     uint32_t color = current_view.slot_colors[slot] & 0xffffffUL;
     uint8_t i;
     (void)snprintf(wanted[1].text, sizeof(wanted[1].text), "DEVICE SETTINGS");
@@ -105,19 +105,22 @@ static void compose_settings(void)
     wanted[2].foreground = COLOR_YELLOW;
     (void)snprintf(wanted[3].text, sizeof(wanted[3].text), "  ACTION COUNT       %u / 8", (unsigned)current_view.class_limit);
     (void)snprintf(wanted[4].text, sizeof(wanted[4].text), "  DEMOS PER ACTION   %u / 3", (unsigned)current_view.config_demos);
-    (void)snprintf(wanted[5].text, sizeof(wanted[5].text), "  COLOR FOR ACTION   %u", (unsigned)slot + 1U);
-    (void)snprintf(wanted[6].text, sizeof(wanted[6].text), "  RED                %3u", (unsigned)((color >> 16) & 255U));
-    (void)snprintf(wanted[7].text, sizeof(wanted[7].text), "  GREEN              %3u", (unsigned)((color >> 8) & 255U));
-    (void)snprintf(wanted[8].text, sizeof(wanted[8].text), "  BLUE               %3u", (unsigned)(color & 255U));
-    (void)snprintf(wanted[9].text, sizeof(wanted[9].text), "  SAVE AND EXIT");
-    (void)snprintf(wanted[10].text, sizeof(wanted[10].text), "  CANCEL");
-    for (i = 3U; i <= 10U; ++i) wanted[i].foreground = COLOR_MUTED;
+    (void)snprintf(wanted[5].text, sizeof(wanted[5].text), "  RGB HOLD TIME      %u.%u s",
+        (unsigned)current_view.config_rgb_hold_ms / 1000U,
+        ((unsigned)current_view.config_rgb_hold_ms % 1000U) / 100U);
+    (void)snprintf(wanted[6].text, sizeof(wanted[6].text), "  COLOR FOR ACTION   %u", (unsigned)slot + 1U);
+    (void)snprintf(wanted[7].text, sizeof(wanted[7].text), "  RED                %3u", (unsigned)((color >> 16) & 255U));
+    (void)snprintf(wanted[8].text, sizeof(wanted[8].text), "  GREEN              %3u", (unsigned)((color >> 8) & 255U));
+    (void)snprintf(wanted[9].text, sizeof(wanted[9].text), "  BLUE               %3u", (unsigned)(color & 255U));
+    (void)snprintf(wanted[10].text, sizeof(wanted[10].text), "  SAVE AND EXIT");
+    (void)snprintf(wanted[11].text, sizeof(wanted[11].text), "  CANCEL");
+    for (i = 3U; i <= 11U; ++i) wanted[i].foreground = COLOR_MUTED;
     wanted[3U + selected_row].text[0] = '>';
     wanted[3U + selected_row].foreground = COLOR_YELLOW;
-    (void)snprintf(wanted[11].text, sizeof(wanted[11].text), "RGB #%06lX", (unsigned long)color);
-    (void)snprintf(wanted[12].text, sizeof(wanted[12].text), "UP/DOWN SELECT   < > CHANGE");
+    (void)snprintf(wanted[12].text, sizeof(wanted[12].text), "RGB #%06lX   < > CHANGE", (unsigned long)color);
     (void)snprintf(wanted[13].text, sizeof(wanted[13].text), "%s",
-                   selected_row >= 3U && selected_row <= 5U ? "OK +1   < > +/-17" : "OK SELECT");
+                   selected_row >= 4U && selected_row <= 6U ? "OK +1   < > +/-17" :
+                   selected_row == 2U ? "HOLD +/-0.1s   UP/DOWN SELECT" : "UP/DOWN SELECT   OK SELECT");
     if (strlen(current_view.message) > TEXT_LENGTH)
         (void)snprintf(wanted[14].text, sizeof(wanted[14].text), "%s", current_view.message + TEXT_LENGTH);
     wanted[14].foreground = COLOR_YELLOW;

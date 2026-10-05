@@ -104,6 +104,13 @@ def parse_line(line):
         if len(fields) != 3:
             raise ValueError("CONFIG requires class limit and demonstration target")
         record.update(class_limit=integer(fields[1], 1, 8), demo_target=integer(fields[2], 1, 3))
+    elif kind == "TIMING":
+        if len(fields) != 2:
+            raise ValueError("TIMING requires RGB hold duration")
+        duration = integer(fields[1], 100, 30000)
+        if duration % 100:
+            raise ValueError("RGB hold duration must use 100 ms steps")
+        record["rgb_hold_ms"] = duration
     elif kind == "COLOR":
         if len(fields) != 3 or not re.fullmatch(r"[0-9a-fA-F]{6}", fields[2]):
             raise ValueError("COLOR requires slot and six-digit RGB hex")

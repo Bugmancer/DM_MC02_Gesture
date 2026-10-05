@@ -206,8 +206,10 @@
               <label>示范次数<select id="config-demo-target" aria-label="每个动作的示范次数">
                 <option>1</option><option>2</option><option selected>3</option>
               </select></label>
+              <label>灯色持续时间<input id="config-rgb-hold" type="number" min="0.1" max="30" step="0.1" value="3" required aria-label="灯色持续时间" disabled><span>秒</span></label>
               <button id="config-save" class="button secondary" disabled><i data-lucide="save"></i>保存到板子</button>
               <span id="config-save-status" class="muted" role="status">等待设备同步</span>
+              <span id="config-timing-status" class="muted" hidden>修改灯色持续时间需要 r9 固件</span>
             </div>
             <div class="table-scroll">
               <table class="slot-table">

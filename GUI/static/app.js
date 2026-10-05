@@ -278,6 +278,8 @@ function configDraft() {
     demo_target: ui.state?.config?.demo_target || 1,
     colors: (ui.state?.slots || blankSlots()).map(slot => slot.color),
   };
+  if (hasCapability("RGB_TIMING") && !("rgb_hold_ms" in ui.configDraft))
+    ui.configDraft.rgb_hold_ms = ui.state?.config?.rgb_hold_ms || 3000;
   return ui.configDraft;
 }
 
@@ -286,10 +288,20 @@ function renderBoardConfig() {
   const pending = ui.configSubmitting || ui.state?.config_write?.state === "pending";
   const busy = ui.busy || pending || ui.state?.training?.state !== "idle" || ui.state?.pending_delete != null;
   const draft = ui.configDraft || ui.state?.config || {class_limit: 8, demo_target: 3};
+  const timingWritable = writable && hasCapability("RGB_TIMING") && ui.state.config?.timing_reported;
+  const holdInput = $("#config-rgb-hold");
+  const holdMs = "rgb_hold_ms" in draft ? draft.rgb_hold_ms : 3000;
+  if (document.activeElement !== holdInput)
+    holdInput.value = holdMs === null ? "" : holdMs / 1000;
+  holdInput.disabled = !timingWritable || busy;
+  holdInput.title = hasCapability("RGB_TIMING") ? "确认识别后 RGB 灯色保持时长" : "修改灯色持续时间需要 r9 固件";
+  $("#config-timing-status").hidden = !writable || hasCapability("RGB_TIMING");
   $("#config-class-limit").value = draft.class_limit;
   $("#config-demo-target").value = draft.demo_target;
   $("#config-class-limit").disabled = $("#config-demo-target").disabled = !writable || busy;
-  $("#config-save").disabled = !writable || busy || !ui.configDirty;
+  const validHold = Number.isInteger(holdMs) && holdMs >= 100 && holdMs <= 30000 && holdMs % 100 === 0;
+  $("#config-save").disabled = !writable || busy || !ui.configDirty ||
+    (timingWritable && (!validHold || !holdInput.checkValidity()));
   $("#config-save-status").textContent = !isConnected() ? "等待设备同步"
     : !writable ? "网页修改配置需要 r8 固件"
     : pending ? "正在保存到板载 Flash…"
@@ -526,7 +538,8 @@ function renderState() {
   $("#metric-latency").innerHTML =
     `${connected ? numberText(status.max_feed_us) : "—"}<small> μs</small>`;
   const liveMatch = state.live_match || {};
-  const visibleMatch = autonomous
+  const confirmedOnly = autonomous || hasCapability("RGB_TIMING");
+  const visibleMatch = confirmedOnly
     ? state.recent_match || {}
     : liveMatch.id
       ? liveMatch
@@ -535,7 +548,7 @@ function renderState() {
     connected && status.armed && hasCapability("LIVE_MATCH")
       ? Number(visibleMatch.id) || 0
       : 0;
-  $("#live-match-label").textContent = autonomous
+  $("#live-match-label").textContent = confirmedOnly
     ? "确认识别 · RGB"
     : candidate && !liveMatch.id
       ? "刚刚匹配 · RGB"
@@ -1227,6 +1240,12 @@ async function refreshCaptures() {
 }
 
 function bindEvents() {
+  $("#config-rgb-hold").addEventListener("input", event => {
+    configDraft().rgb_hold_ms = Number.isFinite(event.target.valueAsNumber)
+      ? Math.round(event.target.valueAsNumber * 1000) : null;
+    ui.configDirty = true;
+    renderState();
+  });
   for (const [selector, field] of [["#config-class-limit", "class_limit"], ["#config-demo-target", "demo_target"]]) {
     $(selector).addEventListener("change", event => {
       configDraft()[field] = Number(event.target.value);

@@ -10,6 +10,7 @@ settings and templates share the board store's existing transaction boundary.
 | --- | --- | --- |
 | `class_limit` | 1 through 8 | 8 |
 | `demo_target` | 1 through 3 | 1 |
+| `rgb_hold_ms` | 100 through 30000 in 100 ms steps | 3000 |
 | `colors[8]` | `0x000000` through `0xFFFFFF` | Existing eight board colors |
 
 Colors are packed `0x00RRGGBB`; each RGB channel spans 0 through 255. Defaults
@@ -28,17 +29,19 @@ models. The application enforces the configured target before confirmation.
 
 ## API
 
-Firmware r8 accepts a complete USB configuration command:
+Firmware r9 accepts a complete USB configuration command:
 
 ```text
-configure 2 3 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203
+configure 2 3 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 5000
 ```
 
 The arguments are the class limit, demonstration target and exactly eight
-six-digit RGB colors. The command fits the 80-byte USB input buffer. Changes
+six-digit RGB colors and the RGB hold time in milliseconds. Omitting the hold
+time preserves the current value, so r8 GUI commands remain valid. The longest
+command is 76 bytes including LF and fits the 80-byte USB input buffer. Changes
 are rejected during learning, deletion confirmation or on-board settings.
 One flash transaction saves the complete settings and model; success emits
-`CONFIG` / `COLOR` records followed by `CONFIG_RESULT,SAVED`. Failure emits
+`CONFIG` / `COLOR` / `TIMING` records followed by `CONFIG_RESULT,SAVED`. Failure emits
 `CONFIG_RESULT,FAILED` and restores the previous settings. Recognition resumes
 when the sensor and sampling timer remain ready. The GUI waits for this result
 and does not apply its local draft optimistically.
@@ -73,12 +76,16 @@ length = gc_export(&config, &engine, blob, sizeof(blob));
 
 ## Storage Format
 
-The `GCF1` version 1 envelope is `GC_HEADER_BYTES` (currently 56) bytes, followed
+The `GCF1` version 2 envelope is `GC_HEADER_BYTES` (currently 56) bytes, followed
 by the unmodified `GDT1` model format. It contains the version, header and total
-lengths, settings, embedded model length, reserved zero bytes, and an outer
+lengths, settings, embedded model length, and an outer
 CRC32. The outer CRC includes all bytes with its own four-byte field treated as
 zero. The embedded model retains its own existing CRC and validation rules.
 Current exports are 14,184 bytes; `GC_BLOB_MAX` reserves 15,056 bytes.
+
+Version 2 stores `rgb_hold_ms` in the former reserved bytes 18 and 19, in
+little-endian order. Version 1 imports with a 3000 ms hold while preserving its
+limits, colors and templates. The total header and model sizes do not grow.
 
 Old bare `GDT1` models import with default settings. Class IDs, names and template
 contents are preserved. The next successful save writes the new envelope.

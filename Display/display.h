@@ -28,6 +28,7 @@ typedef struct {
     uint8_t settings_row;
     uint8_t class_limit;
     uint8_t config_demos;
+    uint16_t config_rgb_hold_ms;
     uint8_t config_slot;
     uint8_t learning_count;
     uint8_t learning_target;

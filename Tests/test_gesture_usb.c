@@ -202,6 +202,22 @@ static void test_line_parser_rejects_overflow_and_control_bytes(void)
     assert(command_count == 1U);
 }
 
+static void test_rgb_timing_configuration_crosses_usb_packet_boundary(void)
+{
+    static const uint8_t line[] =
+        "configure 8 3 ffffff ffffff ffffff ffffff ffffff ffffff ffffff ffffff 30000\n";
+    reset_usb();
+    connect_ready();
+    assert(sizeof(line) - 1U == 76U);
+    gesture_usb_receive(line, 64U);
+    gesture_usb_process();
+    assert(command_count == 0U);
+    gesture_usb_receive(line + 64U, sizeof(line) - 1U - 64U);
+    gesture_usb_process();
+    assert(command_count == 1U && strlen(received_command) == 75U);
+    assert(!memcmp(received_command, line, 75U));
+}
+
 int main(void)
 {
     test_cdc_null_and_not_configured_guard();
@@ -211,6 +227,7 @@ int main(void)
     test_reconnect_during_command_discards_remaining_lines();
     test_active_packet_is_stable_and_raw_backpressure();
     test_line_parser_rejects_overflow_and_control_bytes();
-    puts("Gesture USB tests passed (7 cases, including generated CDC callbacks).");
+    test_rgb_timing_configuration_crosses_usb_packet_boundary();
+    puts("Gesture USB tests passed (8 cases, including generated CDC callbacks).");
     return 0;
 }

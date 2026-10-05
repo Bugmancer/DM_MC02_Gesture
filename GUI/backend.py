@@ -117,7 +117,8 @@ class Controller:
                         "usb_drops": 0, "max_feed_us": 0, "max_read_us": 0}
         self._protocol = {"version": None, "inventory": False, "manual_training": False,
                           "firmware": None, "capabilities": [], "requires_calibration": False}
-        self._config = {"class_limit": 8, "demo_target": 3, "reported": False}
+        self._config = {"class_limit": 8, "demo_target": 3, "reported": False,
+                        "rgb_hold_ms": 3000, "timing_reported": False}
         self._config_write = {"state": "idle", "message": ""}
         self._config_write_started = None
         self._slots = [{"id": i, "state": "unknown", "templates": None,
@@ -290,7 +291,8 @@ class Controller:
             if self._last_match is None or time.monotonic() - self._last_match > 0.8:
                 live_match["id"] = 0
             recent_match = None
-            match_hold = 3 if "AUTO_RECOGNITION" in self._protocol["capabilities"] else 0.35
+            match_hold = (self._config["rgb_hold_ms"] / 1000
+                          if "AUTO_RECOGNITION" in self._protocol["capabilities"] else 0.35)
             if (self._status["armed"] and self._last_confident_match is not None
                     and time.monotonic() - self._last_confident_match <= match_hold):
                 recent_match = self._recent_match
@@ -362,12 +364,21 @@ class Controller:
                 any(not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value)
                     for value in colors)):
             raise ValueError("Eight RGB colors in #RRGGBB format are required")
+        hold_ms = None
+        if "rgb_hold_ms" in payload:
+            hold_ms = _integer(payload["rgb_hold_ms"], 100, 30000)
+            if hold_ms % 100:
+                raise ValueError("灯色持续时间须以 0.1 秒为步长")
         command = f"configure {limit} {demos} " + " ".join(value[1:].lower() for value in colors)
         with self._lock:
             if self._connection["state"] != "connected":
                 raise ValueError("请先连接设备")
             if "GUI_CONFIG" not in self._protocol["capabilities"]:
                 raise ValueError("网页修改板端配置需要 r8 固件")
+            if "RGB_TIMING" in self._protocol["capabilities"]:
+                command += f" {hold_ms if hold_ms is not None else self._config['rgb_hold_ms']}"
+            elif hold_ms is not None:
+                raise ValueError("修改灯色持续时间需要 r9 固件")
             if self._training["state"] != "idle" or self._pending_delete is not None:
                 raise ValueError("请先完成或取消学习、删除操作")
             if self._config_write["state"] == "pending":
@@ -689,6 +700,8 @@ class Controller:
             self._config.update(class_limit=record["class_limit"], demo_target=record["demo_target"], reported=True)
             self._training["required"] = record["demo_target"]
             self._protocol["inventory"] = all(slot["state"] != "unknown" for slot in self._slots[:record["class_limit"]])
+        elif kind == "TIMING":
+            self._config.update(rgb_hold_ms=record["rgb_hold_ms"], timing_reported=True)
         elif kind == "COLOR":
             self._slots[record["id"] - 1]["color"] = record["color"]
         elif kind == "CONFIG_RESULT":
@@ -844,8 +857,9 @@ class Controller:
 
     def _demo_inventory(self):
         training = self._training
-        self._accept(parse_line("FIRMWARE,demo-gesture-20261006-r8,KEY_CAPTURE,NO_CALIBRATION,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG"))
+        self._accept(parse_line("FIRMWARE,demo-gesture-20261006-r9,KEY_CAPTURE,NO_CALIBRATION,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG,RGB_TIMING"))
         self._accept(parse_line(f"CONFIG,{self._config['class_limit']},{self._config['demo_target']}"))
+        self._accept(parse_line(f"TIMING,{self._config['rgb_hold_ms']}"))
         self._accept(parse_line(f"INFO,1,7,1,{int(training['state'] != 'idle')},"
                                f"{self._pending_delete or training['slot'] or 1},{training['collected']},"
                                f"{int(training['state'] == 'ready')},{int(self._pending_delete is not None)}"))
@@ -927,8 +941,10 @@ class Controller:
         elif name == "configure":
             values = arg.split()
             self._accept(parse_line(f"CONFIG,{values[0]},{values[1]}"))
-            for index, color in enumerate(values[2:], start=1):
+            for index, color in enumerate(values[2:10], start=1):
                 self._accept(parse_line(f"COLOR,{index},{color}"))
+            if len(values) == 11:
+                self._accept(parse_line(f"TIMING,{values[10]}"))
             self._accept(parse_line("CONFIG_RESULT,SAVED"))
             self._accept(parse_line("STATE,ARMED"))
         elif name == "arm":

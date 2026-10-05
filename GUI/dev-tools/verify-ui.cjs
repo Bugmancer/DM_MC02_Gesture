@@ -100,6 +100,66 @@ async function onlyView(page, name) {
   assert.equal(new URL(page.url()).hash, `#${name}`);
 }
 
+async function verifyRgbTimingUI(fixture) {
+  const page = await browser.newPage({viewport: {width: 1440, height: 1000}});
+  const mock = structuredClone(fixture);
+  mock.events = [];
+  mock.connection.epoch += 1;
+  mock.training = {state: "idle", slot: null, required: 3, collected: 0};
+  mock.status.armed = 1;
+  mock.pending_delete = null;
+  mock.config = {...mock.config, rgb_hold_ms: 4600, timing_reported: true};
+  mock.config_write = {state: "idle", message: ""};
+  mock.live_match = {id: 2, distance: .11};
+  mock.recent_match = null;
+  await page.route("**/api/state*", route => route.fulfill({json: mock}));
+  const writes = [];
+  await page.route("**/api/board/config", route => {
+    const payload = route.request().postDataJSON();
+    writes.push(payload);
+    mock.config = {...mock.config, class_limit: payload.class_limit, demo_target: payload.demo_target};
+    if ("rgb_hold_ms" in payload) mock.config.rgb_hold_ms = payload.rgb_hold_ms;
+    mock.slots.forEach(slot => { slot.enabled = slot.id <= payload.class_limit; });
+    mock.config_write = {state: "saved", message: "已保存到板载 Flash"};
+    return route.fulfill({json: {ok: true, state: mock}});
+  });
+  await page.goto(url + "/#library");
+  await page.waitForFunction(() => !document.querySelector("#config-rgb-hold").disabled);
+  assert.equal(await page.locator("#config-rgb-hold").inputValue(), "4.6");
+  assert.equal(await page.locator("#live-match-color").isHidden(), true,
+    "A live candidate must not show a confirmed action RGB color");
+  mock.recent_match = {id: 1, distance: .12};
+  await page.waitForFunction(() => !document.querySelector("#live-match-color").hidden);
+  assert.equal(await page.locator("#live-match-name").textContent(), mock.slots[0].name);
+  await page.locator("#config-rgb-hold").fill("0");
+  assert.equal(await page.locator("#config-save").isDisabled(), true);
+  await page.locator("#config-rgb-hold").fill("");
+  await page.locator("#config-rgb-hold").blur();
+  await delay(700);
+  assert.equal(await page.locator("#config-rgb-hold").inputValue(), "",
+    "Polling must preserve an empty unsaved duration");
+  assert.equal(await page.locator("#config-save").isDisabled(), true);
+  await page.locator("#config-rgb-hold").fill("30");
+  await Promise.all([page.waitForResponse(response => response.url().endsWith("/api/board/config")),
+    page.locator("#config-save").click()]);
+  await page.waitForFunction(() => document.querySelector("#config-save").disabled);
+  assert.equal(writes[0].rgb_hold_ms, 30000);
+  mock.protocol.capabilities = mock.protocol.capabilities.filter(cap => cap !== "RGB_TIMING");
+  mock.protocol.firmware = "gesture-20261006-r8";
+  mock.config.timing_reported = false;
+  await page.waitForFunction(() => document.querySelector("#config-rgb-hold").disabled &&
+    !document.querySelector("#config-timing-status").hidden);
+  assert.equal(await page.locator("#config-class-limit").isEnabled(), true);
+  await page.locator("#config-class-limit").selectOption("4");
+  await Promise.all([page.waitForResponse(response => response.url().endsWith("/api/board/config")),
+    page.locator("#config-save").click()]);
+  await page.waitForFunction(() => document.querySelector("#config-save").disabled);
+  assert.equal("rgb_hold_ms" in writes[1], false,
+    "r8 saves counts and colors using the original configuration protocol");
+  await page.close();
+  return {confirmedOnly: true, legacyConfiguration: true, savedHoldMs: writes[0].rgb_hold_ms};
+}
+
 async function verifyViewRecovery() {
   const page = await browser.newPage({
     viewport: { width: 1440, height: 1000 },
@@ -365,7 +425,7 @@ function changedPixels(first, second) {
   );
   assert.ok(
     (await page.locator("#firmware-version").textContent()).includes(
-      "gesture-20261006-r8",
+      "gesture-20261006-r9",
     ),
   );
   assert.equal(await page.locator("#firmware-warning").isHidden(), true);
@@ -374,12 +434,16 @@ function changedPixels(first, second) {
   assert.equal(await page.locator("#armed-toggle").isChecked(), true);
   await page.locator("#config-class-limit").selectOption("5");
   await page.locator("#config-demo-target").selectOption("2");
+  assert.equal(await page.locator("#config-rgb-hold").isEnabled(), true);
+  await page.locator("#config-rgb-hold").fill("4.6");
   await page.locator('[data-slot="1"] .slot-color-input').fill("#123456");
   await delay(700);
   assert.equal(await page.locator("#config-class-limit").inputValue(), "5");
   assert.equal(await page.locator("#config-demo-target").inputValue(), "2");
+  assert.equal(await page.locator("#config-rgb-hold").inputValue(), "4.6");
   assert.equal((await api("/api/state")).config.class_limit, 8,
     "An unsaved draft must not change the board");
+  assert.equal((await api("/api/state")).config.rgb_hold_ms, 3000);
   assert.equal(await page.locator("#config-save").isEnabled(), true);
   await page.locator("#config-save").click();
   await page.waitForFunction(() =>
@@ -387,6 +451,7 @@ function changedPixels(first, second) {
   let configured = await api("/api/state");
   assert.equal(configured.config.class_limit, 5);
   assert.equal(configured.config.demo_target, 2);
+  assert.equal(configured.config.rgb_hold_ms, 4600);
   assert.equal(configured.slots[0].color, "#123456");
   assert.equal(configured.slots[0].state, "saved",
     "Changing settings must preserve existing templates");
@@ -400,6 +465,7 @@ function changedPixels(first, second) {
   await page.setViewportSize({width: 1440, height: 1000});
   await page.locator("#config-class-limit").selectOption("8");
   await page.locator("#config-demo-target").selectOption("3");
+  await page.locator("#config-rgb-hold").fill("3");
   await page.locator("#config-save").click();
   await page.waitForFunction(() =>
     document.querySelector("#slot-rows tr[data-slot='8']").hidden === false &&
@@ -407,6 +473,7 @@ function changedPixels(first, second) {
   configured = await api("/api/state");
   assert.equal(configured.config.class_limit, 8);
   assert.equal(configured.config.demo_target, 3);
+  assert.equal(configured.config.rgb_hold_ms, 3000);
   assert.equal(configured.slots[0].color, "#123456");
   const third = page.locator('#slot-rows tr[data-slot="3"]');
   await third.locator(".name-input").click();
@@ -783,6 +850,7 @@ function changedPixels(first, second) {
     fullPage: true,
   });
   await page.unroute("**/api/state*");
+  const rgbTiming = await verifyRgbTimingUI(await api("/api/state"));
   await page.locator("#connect-button").click();
   await page.waitForFunction(
     () => document.querySelector("#metric-armed").textContent === "等待连接",
@@ -798,6 +866,7 @@ function changedPixels(first, second) {
         motionPixels,
         mobileSpatialPixels,
         viewRecovery,
+        rgbTiming,
         screenshots,
         dataDir,
       },

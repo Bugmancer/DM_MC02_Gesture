@@ -36,16 +36,15 @@ static void settings_key(BoardKey key);
 static void show_match_rgb(uint8_t slot, uint32_t now, uint32_t hold_ms)
 {
     if (slot >= GE_MAX_CLASSES) return;
-    /* Preview refreshes cannot shorten the longer accepted-event indication. */
-    if (slot != rgb_match_slot || (int32_t)(rgb_match_until - now) < (int32_t)hold_ms)
-        rgb_match_until = now + hold_ms;
+    rgb_match_until = now + hold_ms;
+    rgb_accepted_until = rgb_match_until;
     rgb_match_slot = slot;
     update_rgb(now);
 }
 
 static void report_firmware(void)
 {
-    gesture_usb_log(0, "FIRMWARE,gesture-20261006-r8,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG\r\n");
+    gesture_usb_log(0, "FIRMWARE,gesture-20261006-r9,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG,RGB_TIMING\r\n");
 }
 
 static void report_capture(void)
@@ -97,6 +96,7 @@ static void update_view(void)
     view.settings_row = settings_row;
     view.class_limit = settings_open ? config_draft.class_limit : config.class_limit;
     view.config_demos = settings_open ? config_draft.demo_target : config.demo_target;
+    view.config_rgb_hold_ms = settings_open ? config_draft.rgb_hold_ms : config.rgb_hold_ms;
     view.config_slot = settings_slot;
     memcpy(view.slot_colors, settings_open ? config_draft.colors : config.colors, sizeof(view.slot_colors));
     view.imu_ok = (uint8_t)((ready_mask & BOARD_READY_IMU) && !consecutive_errors);
@@ -159,6 +159,7 @@ static void set_armed(int enable)
         gesture_usb_log(0, "ERROR,ARM,BUSY\r\n");
         return;
     }
+    if (armed) return;
     reset_stream();
     armed = 1u;
     ge_set_recognition(&engine, 1);
@@ -310,6 +311,7 @@ static void report_config(void)
         offset += (unsigned)snprintf(lines + offset, sizeof(lines) - offset,
             "COLOR,%u,%06lX\r\n", slot + 1u, (unsigned long)config.colors[slot]);
     gesture_usb_log(0, "%s", lines);
+    gesture_usb_log(0, "TIMING,%u\r\n", (unsigned)config.rgb_hold_ms);
 }
 
 static void settings_begin(void)
@@ -368,17 +370,23 @@ static int settings_save(void)
 static void configure_command(const char *line)
 {
     gesture_config_t candidate;
-    unsigned limit, demos, slot, digit;
+    unsigned limit, demos, slot, digit, hold_ms;
     char colors[GE_MAX_CLASSES][7], extra;
-    int parsed, saved;
-    parsed = sscanf(line, "configure %u %u %6s %6s %6s %6s %6s %6s %6s %6s %c",
+    int parsed, saved, consumed = 0;
+    parsed = sscanf(line, "configure %u %u %6s %6s %6s %6s %6s %6s %6s %6s%n",
         &limit, &demos, colors[0], colors[1], colors[2], colors[3],
-        colors[4], colors[5], colors[6], colors[7], &extra);
+        colors[4], colors[5], colors[6], colors[7], &consumed);
     if (parsed != 10 || limit < 1u || limit > GE_MAX_CLASSES ||
         demos < 1u || demos > GE_TEMPLATES_PER_CLASS) goto invalid;
     candidate = config;
     candidate.class_limit = (uint8_t)limit;
     candidate.demo_target = (uint8_t)demos;
+    parsed = sscanf(line + consumed, " %u %c", &hold_ms, &extra);
+    if (parsed == 1) {
+        if (hold_ms < GC_RGB_HOLD_MIN_MS || hold_ms > GC_RGB_HOLD_MAX_MS ||
+            hold_ms % GC_RGB_HOLD_STEP_MS) goto invalid;
+        candidate.rgb_hold_ms = (uint16_t)hold_ms;
+    } else if (strspn(line + consumed, " \t\r\n") != strlen(line + consumed)) goto invalid;
     for (slot = 0u; slot < GE_MAX_CLASSES; ++slot) {
         uint32_t color = 0u;
         if (strlen(colors[slot]) != 6u) goto invalid;
@@ -416,10 +424,10 @@ static void settings_key(BoardKey key)
 {
     int direction = key == BOARD_KEY_LEFT ? -1 : 1;
     uint8_t *value = NULL;
-    if (key == BOARD_KEY_UP) settings_row = (uint8_t)((settings_row + 7u) % 8u);
-    else if (key == BOARD_KEY_DOWN) settings_row = (uint8_t)((settings_row + 1u) % 8u);
-    else if (key == BOARD_KEY_OK && settings_row == 6u) { settings_save(); return; }
-    else if (key == BOARD_KEY_OK && settings_row == 7u) { cancel(); update_view(); return; }
+    if (key == BOARD_KEY_UP) settings_row = (uint8_t)((settings_row + 8u) % 9u);
+    else if (key == BOARD_KEY_DOWN) settings_row = (uint8_t)((settings_row + 1u) % 9u);
+    else if (key == BOARD_KEY_OK && settings_row == 7u) { settings_save(); return; }
+    else if (key == BOARD_KEY_OK && settings_row == 8u) { cancel(); update_view(); return; }
     else if (key == BOARD_KEY_LEFT || key == BOARD_KEY_RIGHT || key == BOARD_KEY_OK) {
         if (settings_row == 0u) value = &config_draft.class_limit;
         if (settings_row == 1u) value = &config_draft.demo_target;
@@ -429,10 +437,15 @@ static void settings_key(BoardKey key)
             if (direction < 0 && *value > 1u) --*value;
             if (settings_slot >= config_draft.class_limit) settings_slot = (uint8_t)(config_draft.class_limit - 1u);
         } else if (settings_row == 2u) {
+            int duration = (int)config_draft.rgb_hold_ms + direction * (int)GC_RGB_HOLD_STEP_MS;
+            if (duration < (int)GC_RGB_HOLD_MIN_MS) duration = (int)GC_RGB_HOLD_MIN_MS;
+            if (duration > (int)GC_RGB_HOLD_MAX_MS) duration = (int)GC_RGB_HOLD_MAX_MS;
+            config_draft.rgb_hold_ms = (uint16_t)duration;
+        } else if (settings_row == 3u) {
             settings_slot = (uint8_t)((settings_slot +
                 (direction > 0 ? 1u : config_draft.class_limit - 1u)) % config_draft.class_limit);
-        } else if (settings_row >= 3u && settings_row <= 5u) {
-            unsigned shift = (5u - settings_row) * 8u;
+        } else if (settings_row >= 4u && settings_row <= 6u) {
+            unsigned shift = (6u - settings_row) * 8u;
             int channel = (int)((config_draft.colors[settings_slot] >> shift) & 255u);
             channel = key == BOARD_KEY_OK ? (channel + 1) % 256 : channel + direction * 17;
             if (channel < 0) channel = 0;
@@ -591,8 +604,8 @@ static void engine_events(uint32_t now)
                 transient_until = 0u;
                 message(view.best_slot >= 0 ? "Matching gesture" : "Tracking motion");
             }
-            if (view.best_slot >= 0 && (int32_t)(rgb_accepted_until - now) <= 0)
-                show_match_rgb(event.class_id, now, 200u);
+            /* Candidates update scores only. Sharing their 200 ms preview
+             * with the accepted-action LED made rejected matches look accepted. */
             gesture_usb_log(0, "MATCH,%lu,%u,%lu,%lu,%lu\r\n", (unsigned long)now,
                 view.best_slot >= 0 ? (unsigned)event.class_id + 1u : 0u,
                 (unsigned long)(event.distance < 1000.0f ? event.distance * 1000000.0f : 999999999.0f),
@@ -606,10 +619,9 @@ static void engine_events(uint32_t now)
             view.best_score = event.distance;
             view.second_score = event.second_distance;
             view.state = DISPLAY_STATE_MATCH;
-            transient_until = now + 3000u;
+            transient_until = now + config.rgb_hold_ms;
             message("Gesture accepted");
-            rgb_accepted_until = now + 3000u;
-            show_match_rgb(event.class_id, now, 3000u);
+            show_match_rgb(event.class_id, now, config.rgb_hold_ms);
             gesture_usb_log(0, "EVENT,%lu,%u,%lu,%lu,%lu\r\n", (unsigned long)now,
                 (unsigned)event.class_id + 1u, (unsigned long)(event.distance * 1000000.0f),
                 (unsigned long)(event.second_distance < 1000.0f ? event.second_distance * 1000000.0f : 999999999.0f),

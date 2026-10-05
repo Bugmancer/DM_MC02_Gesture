@@ -52,18 +52,20 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(json.loads(body)["token"], self.server.token)
 
     def test_board_config_endpoint_is_authenticated_and_validated(self):
-        payload = {"class_limit": 4, "demo_target": 2, "colors": ["#654321"] * 8}
+        payload = {"class_limit": 4, "demo_target": 2, "colors": ["#654321"] * 8, "rgb_hold_ms": 5000}
         self.request("/api/connect", {"demo": True})
         deadline = time.monotonic() + 2
         while "GUI_CONFIG" not in self.controller.snapshot()["protocol"]["capabilities"] and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertEqual(self.request("/api/board/config", payload, {"X-Gesture-Token": "invalid"})[0], 403)
         self.assertEqual(self.request("/api/board/config", {**payload, "class_limit": 9})[0], 400)
+        self.assertEqual(self.request("/api/board/config", {**payload, "rgb_hold_ms": 150})[0], 400)
         self.assertEqual(self.request("/api/board/config", payload)[0], 200)
         deadline = time.monotonic() + 2
         while self.controller.snapshot()["config_write"]["state"] == "pending" and time.monotonic() < deadline:
             time.sleep(.01)
         self.assertEqual(self.controller.snapshot()["config"]["class_limit"], 4)
+        self.assertEqual(self.controller.snapshot()["config"]["rgb_hold_ms"], 5000)
 
     def test_ui_identity_matches_html_state_and_mutations(self):
         identity = self.server.identity()
