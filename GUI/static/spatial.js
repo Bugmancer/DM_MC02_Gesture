@@ -88,7 +88,7 @@ export function createSpatialView(container) {
   controls.maxDistance = 3;
   controls.maxPolarAngle = Math.PI * 0.91;
   controls.enablePan = true;
-  const cameraOffset = new THREE.Vector3(0.2, 0.22, 0.24);
+  const cameraOffset = new THREE.Vector3(0.3, 0.3, 0.36);
   camera.position.copy(cameraOffset);
   controls.update();
 

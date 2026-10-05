@@ -583,6 +583,8 @@ class ControllerTests(unittest.TestCase):
         state = self.controller.snapshot()
         self.assertEqual([sample["key_down"] for sample in state["pen_samples"]], [False, True, False])
         self.assertEqual([sample["t"] for sample in state["pen_samples"]], [5, 10, 20])
+        self.assertEqual([sample["stroke_id"] for sample in state["pen_samples"]], [0, 1, 1])
+        self.assertEqual(state["pen_corrections"][0]["stroke_id"], 1)
         self.assertTrue(all(len(sample["p"]) == 3 for sample in state["pen_samples"]))
         self.assertEqual(state["key"], {"available": True, "down": False})
         self.controller._process_line("RAW,6,30,0,0,9807,0,0,100")
@@ -621,11 +623,18 @@ class ControllerTests(unittest.TestCase):
             self.controller._process_line(f"RAW,{number},{number * 5},0,0,10807,0,0,0,1")
         held = self.controller.snapshot()["pen_motion"]["position_m"]
         self.assertGreater(held[2], .2)
-        for number in range(401, 801):
+        self.controller._process_line("RAW,401,2005,0,0,10807,0,0,0,0")
+        corrected = self.controller.snapshot()
+        self.assertLess(abs(corrected["pen_motion"]["position_m"][2]), .02)
+        self.assertEqual(corrected["pose"]["position_m"], corrected["pen_motion"]["position_m"])
+        self.assertEqual(corrected["pen_corrections"][-1]["points"][-1], corrected["pen_motion"]["position_m"])
+        for number in range(402, 801):
             self.controller._process_line(f"RAW,{number},{number * 5},0,0,10807,0,0,0,0")
-        self.assertEqual(self.controller.snapshot()["pen_motion"]["position_m"], held)
+        self.assertEqual(self.controller.snapshot()["pen_motion"]["position_m"],
+                         corrected["pen_motion"]["position_m"])
         self.controller.reset_pose()
-        self.assertEqual(self.controller.snapshot()["pen_motion"]["position_m"], held)
+        self.assertEqual(self.controller.snapshot()["pen_motion"]["position_m"], [0.0] * 3)
+        self.assertEqual(self.controller.snapshot()["pen_corrections"], [])
 
     def test_pen_history_ignores_invalid_stale_and_duplicate_data(self):
         self.controller._process_line("RAW,1,5,0,0,9807,0,0,0")
@@ -657,15 +666,15 @@ class ControllerTests(unittest.TestCase):
         self.assertGreater(rebooted["pen_epoch"], zeroed["pen_epoch"])
         self.assertEqual(rebooted["pen_samples"], [])
 
-    def test_pen_history_handles_clock_wrap_and_translation_limit(self):
+    def test_pen_history_handles_clock_wrap_and_missing_key_without_free_translation(self):
         for seq, tick in enumerate((0xFFFFFFF0, 4, 24), start=1):
             self.controller._process_line(f"RAW,{seq},{tick},0,0,9807,0,0,100")
         state = self.controller.snapshot()
         self.assertEqual(len(state["pen_samples"]), 3)
-        self.controller._pose._position_limited = True
         self.controller._process_line("RAW,4,44,0,0,9807,0,0,100")
         limited = self.controller.snapshot()
-        self.assertTrue(limited["pose"]["position_limited"])
+        self.assertFalse(limited["pose"]["position_limited"])
+        self.assertEqual(limited["pose"]["position_m"], [0.0] * 3)
         self.assertEqual(limited["pen_cursor"], state["pen_cursor"] + 1)
         self.assertEqual(limited["pen_epoch"], state["pen_epoch"])
 

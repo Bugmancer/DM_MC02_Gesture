@@ -26,6 +26,11 @@ const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 let browser, url, token;
 
 async function api(route, payload) {
+  assert.notEqual(
+    new URL(url).port,
+    "8765",
+    "Never use the live device server",
+  );
   const response = await fetch(
     url + route,
     payload === undefined
@@ -57,12 +62,237 @@ function scenePixels(buffer) {
   const png = PNG.sync.read(buffer);
   let colored = 0;
   let dark = 0;
+  const axes = [0, 0, 0];
   for (let i = 0; i < png.data.length; i += 4) {
     const [r, g, b] = png.data.subarray(i, i + 3);
     if (Math.max(r, g, b) - Math.min(r, g, b) > 35) colored++;
     if (Math.max(r, g, b) < 150) dark++;
+    if (r > g * 1.3 && r > b * 1.3) axes[0]++;
+    if (g > r * 1.3 && g > b * 1.12) axes[1]++;
+    if (b > r * 1.3 && b > g * 1.2) axes[2]++;
   }
-  return { colored, dark };
+  return { colored, dark, axes };
+}
+
+async function onlyView(page, name) {
+  assert.deepEqual(
+    await page
+      .locator(".tab-view:visible")
+      .evaluateAll((views) => views.map((view) => view.id)),
+    [`view-${name}`],
+    "Exactly the selected view must remain visible",
+  );
+  assert.equal(new URL(page.url()).hash, `#${name}`);
+}
+
+async function verifyViewRecovery() {
+  const page = await browser.newPage({
+    viewport: { width: 1440, height: 1000 },
+  });
+  const baselineSession = await api("/api/session.json");
+  const mock = await api("/api/state");
+  const originalRevision = baselineSession.ui_revision;
+  let revision = originalRevision;
+  let instance = baselineSession.server_instance;
+  let documentLoads = 0;
+  const mutations = [];
+  const errors = [];
+  page.on("pageerror", (error) => errors.push(error.message));
+  mock.connection = {
+    ...mock.connection,
+    state: "disconnected",
+    demo: false,
+    simulation: false,
+  };
+  const draftKey = "dm-mc02-air-pen-world-v1";
+  const draft = {
+    version: 4,
+    dimensions: 3,
+    units: "m",
+    reference_frame: {
+      axes: "gravity-aligned",
+      up_axis: "z",
+      heading: "relative-yaw",
+      origin: "local-inertial",
+    },
+    strokes: [
+      {
+        color: "#397fc5",
+        width: 3,
+        frame: "test",
+        points: [
+          [0, 0, 0],
+          [0.08, 0.05, 0.03],
+        ],
+      },
+    ],
+    color: "#397fc5",
+    width: 3,
+    sensitivity: 1,
+  };
+  await page.addInitScript(
+    ({ key, draft }) => {
+      if (!localStorage.getItem(key))
+        localStorage.setItem(key, JSON.stringify(draft));
+    },
+    { key: draftKey, draft },
+  );
+  await page.route(
+    (requestUrl) => requestUrl.pathname === "/",
+    async (route) => {
+      documentLoads++;
+      const response = await route.fetch();
+      await route.fulfill({
+        response,
+        body: (await response.text()).replaceAll(originalRevision, revision),
+      });
+    },
+  );
+  await page.route("**/api/session.json", (route) =>
+    route.fulfill({
+      json: {
+        ...baselineSession,
+        ui_revision: revision,
+        server_instance: instance,
+      },
+    }),
+  );
+  await page.route("**/api/state*", (route) =>
+    route.fulfill({
+      json: {
+        ...mock,
+        ui_revision: revision,
+        server_instance: instance,
+      },
+    }),
+  );
+  await page.route("**/api/disconnect", (route) => {
+    mutations.push("disconnect");
+    mock.connection.state = "disconnected";
+    return route.fulfill({
+      json: {
+        ok: true,
+        state: { ...mock, ui_revision: revision, server_instance: instance },
+      },
+    });
+  });
+  await page.route("**/api/**", (route) => {
+    if (
+      route.request().method() === "POST" &&
+      new URL(route.request().url()).pathname !== "/api/disconnect"
+    ) {
+      mutations.push(new URL(route.request().url()).pathname);
+      return route.fulfill({
+        status: 400,
+        json: { ok: false, error: "Unexpected mutation in view test" },
+      });
+    }
+    return route.fallback();
+  });
+  async function restoredPen() {
+    await page.waitForFunction(() =>
+      document
+        .querySelector("#pen-stroke-count")
+        ?.textContent.startsWith("1 笔"),
+    );
+    await onlyView(page, "pen");
+    assert.deepEqual(
+      await page.evaluate(
+        (key) => JSON.parse(localStorage.getItem(key)).strokes,
+        draftKey,
+      ),
+      draft.strokes,
+    );
+    assert.notEqual(await page.locator("#pen-status").textContent(), "记录中");
+  }
+  await page.goto(url + "/#pen");
+  await restoredPen();
+  await page.reload();
+  await restoredPen();
+
+  let releaseModule;
+  let moduleRequested;
+  const requested = new Promise((resolve) => {
+    moduleRequested = resolve;
+  });
+  const heldModule = new Promise((resolve) => {
+    releaseModule = resolve;
+  });
+  await page.route("**/spatial.js*", async (route) => {
+    moduleRequested();
+    await heldModule;
+    await route.continue();
+  });
+  await page.locator('[data-tab="spatial"]').click();
+  await requested;
+  await page.locator('[data-tab="pen"]').click();
+  releaseModule();
+  await page.waitForFunction(
+    () => document.querySelectorAll("#spatial-scene canvas").length === 1,
+  );
+  await onlyView(page, "pen");
+  await page.unroute("**/spatial.js*");
+
+  let count = documentLoads;
+  revision = "test-ui-revision-2";
+  await page.waitForFunction(
+    (value) =>
+      document.querySelector("script[data-ui-revision]")?.dataset.uiRevision ===
+      value,
+    revision,
+  );
+  await restoredPen();
+  await delay(700);
+  assert.equal(
+    documentLoads,
+    count + 1,
+    "Asset update must reload exactly once",
+  );
+  count = documentLoads;
+  const refreshedSession = page.waitForResponse(
+    async (response) =>
+      new URL(response.url()).pathname === "/api/session.json" &&
+      (await response.json()).server_instance === "test-restarted-service",
+  );
+  instance = "test-restarted-service";
+  await refreshedSession;
+  await restoredPen();
+  await delay(700);
+  assert.equal(
+    documentLoads,
+    count + 1,
+    "Service restart must reload exactly once",
+  );
+
+  for (const state of ["connecting", "reconnecting"]) {
+    mock.connection = {
+      ...mock.connection,
+      state,
+      port: "COM_TEST",
+      retry_attempt: 2,
+      retry_limit: 5,
+      error: "",
+    };
+    const label = state === "reconnecting" ? "取消重连" : "取消连接";
+    await page.waitForFunction(
+      (label) =>
+        document.querySelector("#connect-button span").textContent === label,
+      label,
+    );
+    assert.equal(await page.locator("#connect-button").isEnabled(), true);
+    assert.equal(await page.locator("#port-select").isDisabled(), true);
+    assert.equal(await page.locator("#demo-button").isDisabled(), true);
+    await page.locator("#connect-button").click();
+    await page.waitForFunction(
+      () =>
+        document.querySelector("#connect-button span").textContent ===
+        "连接设备",
+    );
+  }
+  assert.deepEqual(mutations, ["disconnect", "disconnect"]);
+  assert.deepEqual(errors, [], "Recovery page errors");
+  await page.close();
+  return { reloads: documentLoads, preservedStrokes: draft.strokes.length };
 }
 
 function changedPixels(first, second) {
@@ -327,18 +557,40 @@ function changedPixels(first, second) {
   await page.waitForFunction(
     () => document.querySelector("#pose-pitch").textContent !== "—",
   );
-  await delay(400);
+  const spatialState = await api("/api/state");
+  spatialState.pose = {
+    ...spatialState.pose,
+    available: true,
+    position_m: [0.01, 0.02, 0.01],
+    trail: [
+      [0, 0, 0],
+      [0.01, 0.02, 0.01],
+    ],
+  };
+  await page.route("**/api/state*", (route) =>
+    route.fulfill({ json: spatialState }),
+  );
+  await page.waitForFunction(
+    () => document.querySelector("#pose-x").textContent === "0.010",
+  );
+  await delay(300);
   const sceneBefore = await scene.screenshot();
   const spatialPixels = scenePixels(sceneBefore);
   assert.ok(
-    spatialPixels.colored > 200 && spatialPixels.dark > 1000,
-    `Rendered board and axes expected: ${JSON.stringify(spatialPixels)}`,
+    spatialPixels.colored > 200 &&
+      spatialPixels.axes.every((count) => count > 20),
+    `Fixed world axes and trajectory expected: ${JSON.stringify(spatialPixels)}`,
   );
-  await delay(800);
+  spatialState.pose.position_m = [0.06, 0.03, 0.02];
+  spatialState.pose.trail.push([0.06, 0.03, 0.02]);
+  await page.waitForFunction(
+    () => document.querySelector("#pose-x").textContent === "0.060",
+  );
+  await delay(300);
   const motionPixels = changedPixels(sceneBefore, await scene.screenshot());
   assert.ok(
-    motionPixels > 500,
-    `Sensor-driven scene motion expected: ${motionPixels}`,
+    motionPixels > 80,
+    `Sensor-driven position marker and trail motion expected: ${motionPixels}`,
   );
   const sceneBox = await scene.boundingBox();
   await page.mouse.move(
@@ -364,6 +616,7 @@ function changedPixels(first, second) {
     await page.locator("#pose-trail-button").getAttribute("aria-pressed"),
     "true",
   );
+  await page.unroute("**/api/state*");
   const resetResponse = page.waitForResponse(
     (response) =>
       response.url().endsWith("/api/pose/reset") &&
@@ -424,8 +677,9 @@ function changedPixels(first, second) {
   await noPageOverflow(page);
   const mobileSpatialPixels = scenePixels(await scene.screenshot());
   assert.ok(
-    mobileSpatialPixels.colored > 100 && mobileSpatialPixels.dark > 300,
-    `Mobile board expected: ${JSON.stringify(mobileSpatialPixels)}`,
+    mobileSpatialPixels.colored > 80 &&
+      mobileSpatialPixels.axes.every((count) => count > 5),
+    `Mobile fixed coordinate axes expected: ${JSON.stringify(mobileSpatialPixels)}`,
   );
   await page.screenshot({
     path: path.join(screenshots, "mobile-spatial.png"),
@@ -474,6 +728,7 @@ function changedPixels(first, second) {
     () => document.querySelector("#metric-armed").textContent === "等待连接",
   );
   assert.deepEqual(errors, [], "Browser console errors");
+  const viewRecovery = await verifyViewRecovery();
   console.log(
     JSON.stringify(
       {
@@ -482,6 +737,7 @@ function changedPixels(first, second) {
         spatialPixels,
         motionPixels,
         mobileSpatialPixels,
+        viewRecovery,
         screenshots,
         dataDir,
       },

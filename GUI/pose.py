@@ -1,14 +1,10 @@
-"""Relative IMU pose for the local viewer, with no board calibration prerequisite.
+"""Fusion attitude in a gravity-aligned, right-handed world frame (Z up).
 
-Fusion uses a right-handed, gravity-aligned NWU frame (Z up), SI input, and
-body-to-world quaternions in w,x,y,z order.  The displayed frame is the board
-orientation at the first sample or latest zero(): q_relative = q_origin^-1 * q.
-All displayed vectors use that same frame.  Consequently, zeroing a tilted
-board also tilts the displayed reference axes relative to gravity.
-
-Six-axis IMUs cannot observe absolute yaw or position.  Translation is a
-short-term estimate from gravity-compensated acceleration; stationary updates
-limit drift but cannot distinguish constant velocity from rest.
+Inputs use SI units and body-to-world quaternions use w,x,y,z order.  A
+six-axis IMU supplies relative heading, not geographic north.  zero() keeps
+that world orientation and resets only the translation origin and elapsed
+time.  Translation belongs to the stroke estimator and is supplied through
+set_translation(); this module never integrates acceleration into position.
 """
 
 from collections import deque
@@ -22,16 +18,7 @@ GRAVITY = 9.80665
 SAMPLE_RATE = 200
 MAX_SAMPLE_GAP_S = 0.1
 MAX_WALL_GAP_S = 0.5
-MAX_SPEED_M_S = 10.0
-MAX_DISPLACEMENT_M = 20.0
 UINT32_MASK = 0xFFFFFFFF
-
-
-def _multiply(left, right):
-    w, x, y, z = left
-    a, b, c, d = right
-    return np.array((w*a-x*b-y*c-z*d, w*b+x*a+y*d-z*c,
-                     w*c-x*d+y*a+z*b, w*d+x*c-y*b+z*a))
 
 
 def _normalise_quaternion(value):
@@ -64,50 +51,70 @@ class PoseEstimator:
         self._ahrs.settings = self._fusion_settings
         self._offset = imufusion.Offset(SAMPLE_RATE)
         self._quaternion = np.array((1.0, 0.0, 0.0, 0.0))
-        self._origin = self._quaternion.copy()
-        self._origin_inverse_rotation = np.eye(3)
         self._position = np.zeros(3)
         self._velocity = np.zeros(3)
-        self._filtered_linear = np.zeros(3)
         self._world_linear = np.zeros(3)
-        self._linear = np.zeros(3)
-        self._previous_linear = np.zeros(3)
+        self._body_acceleration = np.zeros(3)
+        self._corrected_gyro = np.zeros(3)
         self._trail = deque(maxlen=160)
         self._last_t = None
         self._last_seq = None
         self._last_wall = None
         self._elapsed = 0.0
-        self._startup_elapsed = 0.0
-        self._trail_elapsed = 0.0
+        self._last_trail_elapsed = None
         self._still_elapsed = 0.0
         self._stationary = False
         self._available = False
-        self._position_limited = False
         self._status = "waiting"
 
     def zero(self):
-        """Keep Fusion running and set the current pose as the relative origin."""
-        self._origin = self._quaternion.copy()
-        self._origin_inverse_rotation = np.asarray(
-            imufusion.Quaternion(self._origin).to_matrix(), dtype=float).T
+        """Reset translation and elapsed time without rotating the world frame."""
         self._position.fill(0)
         self._velocity.fill(0)
-        self._filtered_linear.fill(0)
-        self._linear.fill(0)
-        self._previous_linear.fill(0)
         self._trail.clear()
-        self._trail_elapsed = 0.0
+        self._last_trail_elapsed = None
         self._elapsed = 0.0
-        self._position_limited = False
-        if self._available:
+        if self._available and self._status != "gap":
             self._status = "stationary" if self._stationary else "tracking"
+
+    def set_translation(self, position, velocity, trail=None):
+        """Accept finite world-frame vectors from the stroke estimator.
+
+        Explicit trails replace the preview with their last 160 points.  If
+        omitted, positions are appended at most 10 Hz of accepted sensor time.
+        Invalid updates return False and leave the previous estimate intact.
+        """
+        try:
+            position = np.asarray(position, dtype=float)
+            velocity = np.asarray(velocity, dtype=float)
+            if (position.shape != (3,) or velocity.shape != (3,) or
+                    not np.all(np.isfinite(position)) or not np.all(np.isfinite(velocity))):
+                return False
+            if trail is not None:
+                trail = np.asarray(trail, dtype=float)
+                if trail.shape == (0,):
+                    trail = np.empty((0, 3))
+                if trail.ndim != 2 or trail.shape[1] != 3 or not np.all(np.isfinite(trail)):
+                    return False
+        except (TypeError, ValueError, OverflowError):
+            return False
+        self._position = position.copy()
+        self._velocity = velocity.copy()
+        if trail is not None:
+            self._trail = deque(trail[-160:].tolist(), maxlen=160)
+            self._last_trail_elapsed = self._elapsed
+        elif self._available and self._status != "gap" and (
+                self._last_trail_elapsed is None or
+                self._elapsed - self._last_trail_elapsed + 1e-9 >= 0.1):
+            self._trail.append(position.tolist())
+            self._last_trail_elapsed = self._elapsed
+        return True
 
     def _gap(self):
         self._velocity.fill(0)
         self._world_linear.fill(0)
-        self._filtered_linear.fill(0)
-        self._linear.fill(0)
-        self._previous_linear.fill(0)
+        self._body_acceleration.fill(0)
+        self._corrected_gyro.fill(0)
         self._still_elapsed = 0.0
         self._stationary = False
         self._status = "gap" if self._available else "waiting"
@@ -124,7 +131,8 @@ class PoseEstimator:
                 return None
             acceleration = np.array([record[key] for key in ("ax", "ay", "az")], dtype=float)
             gyroscope = np.array([record[key] for key in ("gx", "gy", "gz")], dtype=float)
-            if (not np.all(np.isfinite(acceleration)) or not np.all(np.isfinite(gyroscope)) or
+            if (acceleration.shape != (3,) or gyroscope.shape != (3,) or
+                    not np.all(np.isfinite(acceleration)) or not np.all(np.isfinite(gyroscope)) or
                     np.any(np.abs(acceleration) > 200) or np.any(np.abs(gyroscope) > 40)):
                 return None
             return int(tick), None if seq is None else int(seq), acceleration, gyroscope
@@ -181,76 +189,48 @@ class PoseEstimator:
             return
 
         self._elapsed += dt
-        self._startup_elapsed = min(0.25, self._startup_elapsed + dt)
-        alpha = dt / (0.035 + dt)
-        # Keep the world's measured residual for pen bias estimation, even
-        # when the spatial viewer suppresses stationary acceleration.
-        self._world_linear += alpha * (earth_linear - self._world_linear)
-        self._filtered_linear += alpha * (earth_linear - self._filtered_linear)
-        self._linear = self._filtered_linear.copy()
-        if np.linalg.norm(self._linear) < 0.12:
-            self._linear.fill(0)
+        self._world_linear = earth_linear.copy()
+        self._body_acceleration = acceleration.copy()
+        self._corrected_gyro = np.deg2rad(corrected_gyro)
 
-        quiet = (np.linalg.norm(gyroscope) < 0.055 and
+        quiet = (np.linalg.norm(self._corrected_gyro) < 0.055 and
                  abs(np.linalg.norm(acceleration) - GRAVITY) < 0.16 and
                  np.linalg.norm(earth_linear) < 0.22)
         self._still_elapsed = min(0.2, self._still_elapsed + dt) if quiet else 0.0
         self._stationary = self._still_elapsed >= 0.2
-        if self._position_limited or self._stationary or self._startup_elapsed < 0.25:
-            self._velocity.fill(0)
-            self._previous_linear.fill(0)
-            if self._stationary:
-                self._filtered_linear.fill(0)
-                self._linear.fill(0)
-        else:
-            next_velocity = self._velocity + (self._previous_linear + self._linear) * (0.5 * dt)
-            next_position = self._position + (self._velocity + next_velocity) * (0.5 * dt)
-            if (not np.all(np.isfinite(next_velocity)) or not np.all(np.isfinite(next_position)) or
-                    np.linalg.norm(next_velocity) > MAX_SPEED_M_S or
-                    np.linalg.norm(next_position) > MAX_DISPLACEMENT_M):
-                # Handheld dead reckoning has left its useful range. Freeze
-                # translation until explicit zero; never silently clip a path.
-                self._position_limited = True
-                self._gap()
-            else:
-                self._position = next_position
-                self._velocity = next_velocity
-                self._previous_linear = self._linear.copy()
-
-        self._status = "gap" if self._position_limited else "stationary" if self._stationary else "tracking"
-        self._trail_elapsed = min(0.1, self._trail_elapsed + dt) if self._position_limited else self._trail_elapsed + dt
-        if not self._position_limited and self._trail_elapsed + 1e-9 >= 0.1:
-            self._trail_elapsed %= 0.1
-            self._trail.append(self._relative_vector(self._position))
+        self._status = "stationary" if self._stationary else "tracking"
         return True
 
-    def _relative_vector(self, vector):
-        return [float(value) for value in self._origin_inverse_rotation @ vector]
+    def _expire(self):
+        if self._available and self._clock() - self._last_wall > MAX_WALL_GAP_S:
+            self._gap()
 
     def world_motion(self):
-        """Gravity-aligned Fusion frame, independent of the display's tilted zero."""
+        """Sensor SI inputs and Fusion attitude in the viewer's world frame."""
+        self._expire()
         return {
             "quaternion": [float(value) for value in self._quaternion],
             "acceleration_m_s2": [float(value) for value in self._world_linear],
+            "body_acceleration_m_s2": [float(value) for value in self._body_acceleration],
+            "gyroscope_rad_s": [float(value) for value in self._corrected_gyro],
             "stationary": self._stationary,
             "timestamp_ms": self._last_t,
+            "available": self._available and self._status != "gap",
+            "status": self._status,
         }
 
     def snapshot(self):
-        if self._available and self._clock() - self._last_wall > MAX_WALL_GAP_S:
-            self._gap()
-        inverse_origin = self._origin * np.array((1.0, -1.0, -1.0, -1.0))
-        quaternion = _normalise_quaternion(_multiply(inverse_origin, self._quaternion))
-        angles = imufusion.Quaternion(quaternion).to_euler()
+        self._expire()
+        angles = imufusion.Quaternion(self._quaternion).to_euler()
         return {
             "available": self._available,
-            "quaternion": [float(value) for value in quaternion],
+            "quaternion": [float(value) for value in self._quaternion],
             "euler_deg": dict(zip(("roll", "pitch", "yaw"), (float(value) for value in angles))),
-            "position_m": self._relative_vector(self._position),
-            "velocity_m_s": self._relative_vector(self._velocity),
-            "linear_accel_m_s2": self._relative_vector(self._linear),
+            "position_m": self._position.tolist(),
+            "velocity_m_s": self._velocity.tolist(),
+            "linear_accel_m_s2": self._world_linear.tolist(),
             "stationary": self._stationary,
-            "position_limited": self._position_limited,
+            "position_limited": False,
             "elapsed_s": float(self._elapsed),
             "status": self._status,
             "trail": [list(point) for point in self._trail],

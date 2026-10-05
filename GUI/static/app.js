@@ -354,7 +354,8 @@ function renderState() {
       ? `${state.connection?.port || "USB CDC"} · 重连 ${state.connection?.retry_attempt || 0}/${state.connection?.retry_limit || 0}`
       : connecting
         ? `${state.connection?.port || "USB CDC"} · 连接中`
-        : $("#port-select").selectedOptions[0]?.dataset.description || "未连接设备";
+        : $("#port-select").selectedOptions[0]?.dataset.description ||
+          "未连接设备";
   $("#armed-toggle").checked = connected && Boolean(status.armed);
   $("#armed-toggle").disabled =
     !connected ||

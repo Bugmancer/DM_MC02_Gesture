@@ -1,14 +1,17 @@
 """Exercise the local HTTP boundary without physical hardware."""
 import http.client
 import json
+import os
 from pathlib import Path
+import shutil
 import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 from backend import Controller
-from server import create_server
+from server import create_server, UI_ASSETS
 
 
 class ServerTests(unittest.TestCase):
@@ -44,8 +47,58 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(status, 200, path)
             self.assertGreater(len(body), 100)
             self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+            self.assertEqual(headers["Cache-Control"], "no-store")
         status, body, _ = self.request("/api/session.json")
         self.assertEqual(json.loads(body)["token"], self.server.token)
+
+    def test_ui_identity_matches_html_state_and_mutations(self):
+        identity = self.server.identity()
+        self.assertRegex(identity["ui_revision"], r"^[a-f0-9]{20}$")
+        self.assertTrue(identity["server_instance"])
+        for route in ("/api/session.json", "/api/health", "/api/state"):
+            status, body, _ = self.request(route)
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            for key, value in identity.items():
+                self.assertEqual(payload[key], value, route)
+        status, body, _ = self.request("/api/disconnect", {})
+        self.assertEqual(status, 200)
+        self.assertEqual({key: json.loads(body)["state"][key] for key in identity}, identity)
+        for route in ("/", "/index.html"):
+            status, body, _ = self.request(route)
+            self.assertEqual(status, 200)
+            self.assertNotIn(b"__GUI_REVISION__", body)
+            self.assertIn(f'data-ui-revision="{identity["ui_revision"]}"'.encode(), body)
+            self.assertIn(f'/app.js?v={identity["ui_revision"]}'.encode(), body)
+        self.assertEqual(self.request("/app.js?v=" + identity["ui_revision"])[1],
+                         self.request("/app.js")[1])
+
+    def test_asset_digest_updates_without_restart_and_reuses_cache(self):
+        assets = Path(self.temp.name) / "static"
+        assets.mkdir()
+        for name in UI_ASSETS:
+            shutil.copy2(self.server.static_dir / name, assets / name)
+        self.server.static_dir = assets.resolve()
+        original = self.server.identity()
+        with patch("pathlib.Path.read_bytes", side_effect=AssertionError("Digest cache was ignored")):
+            self.assertEqual(self.server.identity(), original)
+        script = assets / "app.js"
+        previous = script.stat()
+        script.write_bytes(script.read_bytes() + b"\n// Updated local interface.\n")
+        os.utime(script, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1_000_000))
+        updated = self.server.identity()
+        self.assertNotEqual(updated["ui_revision"], original["ui_revision"])
+        self.assertEqual(updated["server_instance"], original["server_instance"])
+        self.assertIn(updated["ui_revision"].encode(), self.request("/")[1])
+
+    def test_server_restart_changes_instance_and_token_but_keeps_asset_revision(self):
+        other = create_server(self.controller, port=0, data_dir=self.temp.name)
+        try:
+            self.assertEqual(other.identity()["ui_revision"], self.server.identity()["ui_revision"])
+            self.assertNotEqual(other.server_instance, self.server.server_instance)
+            self.assertNotEqual(other.token, self.server.token)
+        finally:
+            other.server_close()
 
     def test_mutations_require_local_host_origin_and_token(self):
         for headers in ({"Host": "external.example"}, {"Origin": "https://external.example"}, {"X-Gesture-Token": "wrong"}):

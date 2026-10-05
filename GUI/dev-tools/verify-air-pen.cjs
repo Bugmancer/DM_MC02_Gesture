@@ -200,9 +200,11 @@ async function downloadFile(page, selector) {
   const liveDraft = await waitDraft(
     page,
     (value) =>
-      value.strokes.length === 1 && value.strokes[0].points.length > 10,
-    "Demo RAW samples through the pose estimator must draw while KEY is held",
+      value.strokes.length === 1 && value.strokes[0].points.length > 10 &&
+      value.strokes[0].corrected === true,
+    "Demo RAW samples must produce one complete RTS-corrected stroke after KEY release",
   );
+  assert.equal(liveDraft.strokes[0].algorithm, "gaitmap-eskf-rts");
   await delay(600);
   assert.deepEqual(
     (await draft(page)).strokes,
@@ -215,23 +217,28 @@ async function downloadFile(page, selector) {
   mock.pen_epoch += 100;
   mock.pen_cursor = 0;
   mock.pen_samples = [];
+  mock.pen_corrections = [];
   mock.pose.available = true;
   mock.pose.status = "tracking";
   mock.pose.position_limited = false;
   mock.connection.demo = false;
   mock.key = { available: true, down: false };
-  mock.pen_motion = { available: true, blocked: false, reason: "ready" };
+  mock.pen_motion = { available: true, blocked: false, reason: "ready", algorithm: "gaitmap-eskf-rts" };
   let sequence = 0,
     responses = 0,
     keyDown = false,
     queuedKeys = null,
-    fixedPosition = null;
+    fixedPosition = null,
+    sourceStrokeId = 0,
+    previousKeyDown = false;
   const worldPoints = new Set();
   await page.route("**/api/state*", async (route) => {
     if (mock.connection.state === "connected") {
       const keys = queuedKeys || Array(3).fill(keyDown);
       queuedKeys = null;
       for (const down of keys) {
+        if (down === true && previousKeyDown !== true) sourceStrokeId++;
+        previousKeyDown = down;
         sequence++;
         const phase = sequence * 0.035;
         const yaw = 0.3 * Math.sin(phase),
@@ -257,6 +264,7 @@ async function downloadFile(page, selector) {
           q,
           p,
           key_down: down,
+          stroke_id: sourceStrokeId,
         });
         mock.pose.quaternion = q;
         mock.pose.position_m = p;
@@ -317,6 +325,26 @@ async function downloadFile(page, selector) {
       `Stroke must vary along XYZ axis ${axis}`,
     );
   }
+
+  fixedPosition = [...mock.pose.position_m];
+  await polls();
+  await page.locator("#pen-center").click();
+  await delay(200);
+  const beforeCorrection = await canvas.screenshot();
+  const correctedPoints = blueStroke.points.map((point) => [
+    Math.round(point[0] * 0.7 * 1000000) / 1000000,
+    Math.round((point[1] + 0.08) * 1000000) / 1000000,
+    Math.round((point[2] - 0.04) * 1000000) / 1000000,
+  ]);
+  mock.pen_corrections = [{ stroke_id: blueStroke.sourceStrokeId, points: correctedPoints }];
+  const correctedDraft = await waitDraft(page, (value) => value.strokes[1]?.corrected === true);
+  assert.equal(correctedDraft.strokes.length, 2, "RTS updates must not add a duplicate stroke");
+  assert.deepEqual(correctedDraft.strokes[1].points, correctedPoints);
+  assert.equal(correctedDraft.strokes[1].revision, 1);
+  const correctionPixels = changedPixels(beforeCorrection, await canvas.screenshot());
+  assert.ok(correctionPixels > 30, `Same-length RTS replacement must rebuild the visible geometry: ${correctionPixels}`);
+  await polls(4);
+  assert.deepEqual((await draft(page)).strokes, correctedDraft.strokes, "Repeated corrections must not change saved strokes again");
 
   fixedPosition = [...mock.pose.position_m];
   const rotationOnly = await holdAndRelease();
@@ -393,6 +421,8 @@ async function downloadFile(page, selector) {
   assert.equal(geometry.units, "m");
   assert.equal(geometry.reference_frame.up_axis, "z");
   assert.equal(geometry.reference_frame.axes, "gravity-aligned");
+  assert.equal(geometry.strokes[1].algorithm, "gaitmap-eskf-rts");
+  assert.equal(geometry.strokes[1].corrected, true);
   assert.equal("tip_length_m" in geometry, false);
   assert.deepEqual(geometry.strokes, quickDraft.strokes);
 
@@ -463,7 +493,12 @@ async function downloadFile(page, selector) {
   );
 
   keyDown = false;
+  mock.pen_corrections.push({
+    stroke_id: tabPaused.strokes.at(-1).sourceStrokeId,
+    points: [[0, 0, 0], [0.3, 0.3, 0.3]],
+  });
   await polls();
+  assert.deepEqual((await draft(page)).strokes, tabPaused.strokes, "A hidden, incomplete stroke cannot be expanded by later RTS history");
   keyDown = true;
   await recording(page, true);
   await polls();
@@ -513,6 +548,7 @@ async function downloadFile(page, selector) {
         mobilePixels,
         orbitChanges,
         zoomChanges,
+        correctionPixels,
         mockResponses: responses,
         screenshots,
         dataDir,

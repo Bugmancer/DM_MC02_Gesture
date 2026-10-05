@@ -168,12 +168,18 @@ class Controller:
         # between HTTP polls still has separate press and release boundaries.
         if delta is not None and delta < 20 and key_down == self._last_pen_key:
             return
-        # Pen coordinates stay in the gravity-aligned world frame; the
-        # spatial viewer's tilted origin and free-running translation are separate.
+        # Both views use one gravity-aligned trajectory and the same origin.
         motion = self._pose.world_motion()
+        pen = self._pen_motion.snapshot()
+        corrections = self._pen_motion.corrections() if key_down is False and self._last_pen_key is True else []
+        corrected_trail = next((item["points"] for item in reversed(corrections)
+                                if item["stroke_id"] == pen["stroke_id"]), None)
+        self._pose.set_translation(pen["position_m"], pen["velocity_m_s"],
+                                   corrected_trail)
         self._pen_cursor += 1
         self._pen_samples.append({"seq": self._pen_cursor, "t": tick,
-                                  "q": motion["quaternion"], "p": self._pen_motion.snapshot()["position_m"],
+                                  "q": motion["quaternion"], "p": pen["position_m"],
+                                  "stroke_id": pen["stroke_id"],
                                   "key_down": key_down})
         self._last_pen_t, self._last_pen_wall = tick, now
         self._last_pen_key = key_down
@@ -263,6 +269,9 @@ class Controller:
                 pose["status"] = "gap"
                 key = {"available": False, "down": None}
             pen_motion = self._pen_motion.snapshot()
+            pose["position_m"] = pen_motion["position_m"].copy()
+            pose["velocity_m_s"] = pen_motion["velocity_m_s"].copy()
+            pose["position_limited"] = pen_motion["reason"] in {"position_limit", "stroke_capacity"}
             pen_motion["available"] = bool(key["available"] and pose["available"] and
                                           self._last_pose_sample is not None and
                                           time.monotonic() - self._last_pose_sample <= 0.5)
@@ -283,6 +292,7 @@ class Controller:
                 "pose": pose, "live_match": live_match, "recent_match": recent_match,
                 "pen_samples": list(self._pen_samples), "pen_cursor": self._pen_cursor,
                 "pen_epoch": self._pen_epoch,
+                "pen_corrections": self._pen_motion.corrections(),
                 "key": key,
                 "pen_motion": pen_motion,
             })
@@ -290,6 +300,7 @@ class Controller:
     def reset_pose(self):
         with self._lock:
             self._pose.zero()
+            self._pen_motion.reset()
             self._reset_pen()
             self._log("POSE", "Origin reset")
         return self.snapshot()
@@ -584,7 +595,8 @@ class Controller:
                         ((record["seq"] - self._last_pen_raw_seq) & 0xFFFFFFFF) != 1):
                     self._pen_motion.invalidate("sample_gap")
                 motion = self._pose.world_motion()
-                self._pen_motion.feed(record["t"], motion["acceleration_m_s2"],
+                self._pen_motion.feed(record["t"], motion["body_acceleration_m_s2"],
+                                      motion["gyroscope_rad_s"], motion["quaternion"],
                                       motion["stationary"], record.get("key_down"))
                 self._last_pose_sample = time.monotonic()
                 self._append_pen_sample(record)

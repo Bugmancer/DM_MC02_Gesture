@@ -26,6 +26,25 @@ const ready = () => {
   model.update(state([sample(1)]));
   return model;
 };
+const rtsSample = (seq, key = false, p = [0, 0, 0], strokeId = 7) => ({
+  ...sample(seq, key, p), stroke_id: strokeId,
+});
+const rtsState = (samples, overrides = {}) => state(samples, {
+  server_instance: "server-a",
+  pen_motion: { available: true, blocked: false, algorithm: "gaitmap-eskf-rts" },
+  pen_corrections: [],
+  ...overrides,
+});
+const readyRts = () => {
+  const model = new AirPenModel();
+  model.setVisible(true);
+  model.update(rtsState([rtsSample(1)]));
+  return model;
+};
+const correction = {
+  stroke_id: 7,
+  points: [[0, 0, 0], [0.05, 0.01, 0.02]],
+};
 
 {
   const model = ready();
@@ -320,6 +339,116 @@ const ready = () => {
   );
 }
 
+{
+  const model = readyRts();
+  model.update(rtsState([rtsSample(2, true), rtsSample(3, true, [0.1, 0.2, 0.3])]));
+  const stroke = model.strokes[0];
+  assert.equal(stroke.completed, false);
+  assert.equal(stroke.algorithm, "gaitmap-eskf-rts");
+  const release = rtsState([rtsSample(4)], { pen_corrections: [correction] });
+  model.update(release);
+  assert.equal(model.strokes.length, 1, "correction replaces rather than appends a stroke");
+  assert.equal(stroke.completed, true);
+  assert.equal(stroke.corrected, true);
+  assert.equal(stroke.sourceStrokeId, 7);
+  assert.ok(stroke.frame.includes("server-a"));
+  assert.deepEqual(stroke.points, correction.points);
+  assert.equal(stroke.revision, 1, "equal point counts still invalidate cached geometry");
+  const revision = model.revision;
+  model.update(release);
+  assert.equal(model.revision, revision, "repeated correction history must be idempotent");
+  const exported = JSON.parse(model.serialize());
+  assert.equal(exported.strokes[0].algorithm, "gaitmap-eskf-rts");
+  const restored = new AirPenModel();
+  assert.equal(restored.restore(model.serialize()), true);
+  assert.deepEqual(restored.strokes, model.strokes);
+}
+
+{
+  const interruptions = {
+    hidden: (model) => model.setVisible(false),
+    timeout: (model) => model.expire(),
+    history_gap: (model) => model.update(rtsState([rtsSample(4, true)])),
+    bad_position: (model) => model.update(rtsState([rtsSample(3, true, [NaN, 0, 0])])),
+    wrong_id: (model) => model.update(rtsState([rtsSample(3, true, [0, 0, 0], 8)])),
+    training: (model) => model.update(rtsState([rtsSample(3, true)], { training: { state: "recording" } })),
+    disconnect: (model) => model.update(rtsState([rtsSample(3, true)], { connection: { state: "disconnected", epoch: 1 } })),
+    storage_limit: (model) => model.update(rtsState([rtsSample(3, true)], { pen_motion: { available: true, blocked: true, reason: "stroke_capacity" } })),
+  };
+  for (const [name, interrupt] of Object.entries(interruptions)) {
+    const model = readyRts();
+    model.update(rtsState([rtsSample(2, true)]));
+    interrupt(model);
+    model.setVisible(true);
+    const before = structuredClone(model.strokes);
+    model.update(rtsState([rtsSample(5)], { pen_corrections: [correction] }));
+    model.update(rtsState([rtsSample(6)], { pen_corrections: [correction] }));
+    assert.deepEqual(model.strokes, before, `${name}: incomplete ink must never gain unobserved points`);
+    assert.equal(model.strokes[0].corrected, false, name);
+    assert.equal(model.strokes[0].completed, false, name);
+  }
+}
+
+{
+  const model = readyRts();
+  model.update(rtsState([rtsSample(2)], { pen_corrections: [correction] }));
+  assert.equal(model.strokes.length, 0, "history alone cannot create a stroke");
+  model.update(rtsState([rtsSample(3, true), rtsSample(4)]));
+  model.undo();
+  model.update(rtsState([rtsSample(5)], { pen_corrections: [correction] }));
+  assert.equal(model.strokes.length, 0, "correction cannot revive undone ink");
+  assert.equal(model.redoStrokes[0].corrected, false, "correction must not alter the undo stack");
+  model.redo();
+  model.update(rtsState([rtsSample(6)], { pen_corrections: [correction] }));
+  assert.equal(model.strokes[0].corrected, true, "explicit redo permits correction of fully recorded ink");
+  model.clear();
+  model.update(rtsState([rtsSample(7)], { pen_corrections: [correction] }));
+  assert.equal(model.strokes.length, 0, "correction cannot revive cleared ink");
+  for (const unavailable of [
+    { training: { state: "recording" } },
+    { training: { state: "ready" } },
+  ]) {
+    model.update(rtsState([rtsSample(8, true), rtsSample(9)], { ...unavailable, pen_corrections: [correction] }));
+    assert.equal(model.strokes.length, 0, "training must not create corrected ink");
+  }
+}
+
+{
+  const model = readyRts();
+  model.update(rtsState([rtsSample(2, true), rtsSample(3)]));
+  const oldStroke = structuredClone(model.strokes[0]);
+  const restarted = { server_instance: "server-b", pen_corrections: [correction] };
+  model.update(rtsState([rtsSample(1)], restarted));
+  model.update(rtsState([rtsSample(2)], restarted));
+  assert.deepEqual(model.strokes[0], oldStroke, "a restarted server cannot reuse an old stroke id");
+  model.update(rtsState([rtsSample(3, true), rtsSample(4)], restarted));
+  assert.equal(model.strokes.length, 2);
+  assert.deepEqual(model.strokes[0], oldStroke);
+  assert.equal(model.strokes[1].corrected, true);
+}
+
+{
+  const model = readyRts();
+  model.update(rtsState([rtsSample(2, true), rtsSample(3)]));
+  const before = structuredClone(model.strokes);
+  for (const points of [[], [[NaN, 0, 0]], [[0, 0]], Array.from({ length: 40001 }, () => [0, 0, 0])]) {
+    model.update(rtsState([], { pen_corrections: [{ stroke_id: 7, points }] }));
+    assert.deepEqual(model.strokes, before, "invalid or oversized corrections preserve recorded ink");
+  }
+  model.update(rtsState([], { pen_corrections: [{ ...correction, stroke_id: -1 }] }));
+  assert.deepEqual(model.strokes, before);
+  const legacy = JSON.parse(model.serialize());
+  for (const s of legacy.strokes) {
+    delete s.algorithm;
+    delete s.sourceStrokeId;
+    delete s.completed;
+    delete s.corrected;
+  }
+  const restored = new AirPenModel();
+  assert.equal(restored.restore(JSON.stringify(legacy)), true, "older world-space drafts remain loadable");
+  assert.equal(restored.strokes[0].algorithm, undefined, "old drafts are not relabeled as RTS output");
+}
+
 console.log(
-  "World-space air pen: 10 groups passed (physical KEY, history, visibility, gaps, training, XYZ, drafts, bounds, drift guard, view zoom).",
+  "World-space air pen: 15 groups passed (KEY capture, 3D drafts, motion boundaries, RTS replacement, incomplete-stroke rejection, restart identity, correction bounds).",
 );

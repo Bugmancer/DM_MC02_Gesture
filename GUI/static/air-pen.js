@@ -4,6 +4,7 @@ import { OrbitControls } from "./vendor/OrbitControls.js";
 const MAX_POINTS = 40000;
 const MAX_STROKES = 300;
 const STORAGE_KEY = "dm-mc02-air-pen-world-v1";
+const TRAJECTORY_ALGORITHM = "gaitmap-eskf-rts";
 const REFERENCE_FRAME = {
   axes: "gravity-aligned",
   up_axis: "z",
@@ -17,6 +18,7 @@ const MOTION_REASONS = {
   speed_limit: "速度估计超限",
   stroke_limit: "单笔位移超限",
   position_limit: "累计位移超限",
+  stroke_capacity: "单笔已达 60 秒存储容量",
 };
 const clamp = (value, low, high) => Math.max(low, Math.min(high, value));
 const finiteVector = (values, size) =>
@@ -32,6 +34,7 @@ const validSample = (s) =>
   Number.isFinite(s.t) &&
   typeof s.key_down === "boolean";
 const roundPoint = (p) => p.map((v) => Math.round(v * 1000000) / 1000000);
+const validStrokeId = (value) => Number.isSafeInteger(value) && value >= 0;
 const scenePoint = (p) => new THREE.Vector3(p[0], p[2], -p[1]);
 
 export class AirPenModel {
@@ -52,6 +55,7 @@ export class AirPenModel {
     this.visible = false;
     this.needsSync = true;
     this.released = false;
+    this.activeStroke = null;
   }
 
   get pointCount() {
@@ -60,6 +64,7 @@ export class AirPenModel {
 
   pause(reason = "等待 KEY 松开") {
     this.recording = false;
+    this.activeStroke = null;
     this.released = false;
     this.reason = reason;
   }
@@ -83,7 +88,11 @@ export class AirPenModel {
   }
 
   update(state) {
-    const epoch = `${state.connection?.epoch}:${state.pen_epoch ?? 0}`;
+    const epoch = JSON.stringify([
+      state.server_instance || "legacy",
+      state.connection?.epoch ?? 0,
+      state.pen_epoch ?? 0,
+    ]);
     if (epoch !== this.epoch) {
       this.epoch = epoch;
       this.lastSeq = 0;
@@ -159,8 +168,20 @@ export class AirPenModel {
       }
       this.preview(sample);
       if (gap) this.pause("数据中断，等待 KEY 松开");
+      if (
+        this.activeStroke &&
+        validStrokeId(this.activeStroke.sourceStrokeId) &&
+        sample.stroke_id !== this.activeStroke.sourceStrokeId
+      ) {
+        this.pause("笔画数据已中断，等待 KEY 松开");
+      }
       if (!sample.key_down) {
+        if (this.recording && this.activeStroke) {
+          this.activeStroke.completed = true;
+          this.revision += 1;
+        }
         this.recording = false;
+        this.activeStroke = null;
         this.released = true;
         this.reason = "等待板上 KEY 按下";
         continue;
@@ -173,12 +194,20 @@ export class AirPenModel {
           this.pause("笔记已满，请导出后清空");
           continue;
         }
-        this.strokes.push({
+        const stroke = {
           color: this.color,
           width: this.width,
           frame: this.epoch,
           points: [[...this.cursor]],
-        });
+          completed: false,
+          corrected: false,
+        };
+        if (validStrokeId(sample.stroke_id)) stroke.sourceStrokeId = sample.stroke_id;
+        if (state.pen_motion?.algorithm === TRAJECTORY_ALGORITHM) {
+          stroke.algorithm = TRAJECTORY_ALGORITHM;
+        }
+        this.strokes.push(stroke);
+        this.activeStroke = stroke;
         this.redoStrokes = [];
         this.recording = true;
         this.released = false;
@@ -186,7 +215,7 @@ export class AirPenModel {
         this.revision += 1;
         if (this.pointCount >= MAX_POINTS) this.pause("笔记已满，请导出后清空");
       } else if (this.recording) {
-        const stroke = this.strokes.at(-1);
+        const stroke = this.activeStroke;
         const last = stroke.points.at(-1);
         if (Math.hypot(...this.cursor.map((v, i) => v - last[i])) >= 0.0003) {
           stroke.points.push([...this.cursor]);
@@ -196,7 +225,33 @@ export class AirPenModel {
         }
       }
     }
+    this.applyCorrections(state.pen_corrections);
     return this.recording;
+  }
+
+  applyCorrections(corrections) {
+    if (!Array.isArray(corrections)) return;
+    for (const correction of corrections) {
+      if (!validStrokeId(correction?.stroke_id)) continue;
+      const stroke = this.strokes.find((candidate) =>
+        candidate.frame === this.epoch &&
+        candidate.sourceStrokeId === correction.stroke_id &&
+        candidate.completed === true &&
+        candidate.corrected !== true,
+      );
+      if (!stroke || !Array.isArray(correction.points) || !correction.points.length) continue;
+      if (this.pointCount - stroke.points.length + correction.points.length > MAX_POINTS) {
+        this.reason = "笔记已满，请导出后清空";
+        continue;
+      }
+      if (!correction.points.every(validPosition)) continue;
+      // Only a fully observed KEY release authorizes replacement of this stroke.
+      stroke.points = correction.points.map(roundPoint);
+      stroke.corrected = true;
+      stroke.algorithm = TRAJECTORY_ALGORITHM;
+      stroke.revision = (stroke.revision || 0) + 1;
+      this.revision += 1;
+    }
   }
 
   undo() {
@@ -254,6 +309,12 @@ export class AirPenModel {
           s.width > 12 ||
           typeof s.frame !== "string" ||
           s.frame.length > 100 ||
+          (s.sourceStrokeId !== undefined && !validStrokeId(s.sourceStrokeId)) ||
+          (s.completed !== undefined && typeof s.completed !== "boolean") ||
+          (s.corrected !== undefined && typeof s.corrected !== "boolean") ||
+          (s.corrected === true && s.completed !== true) ||
+          (s.algorithm !== undefined && (typeof s.algorithm !== "string" || s.algorithm.length > 80)) ||
+          (s.revision !== undefined && (!Number.isSafeInteger(s.revision) || s.revision < 0)) ||
           !Array.isArray(s.points) ||
           !s.points.length ||
           !s.points.every(validPosition)
