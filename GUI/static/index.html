@@ -1,0 +1,704 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light" />
+    <title>DM-MC02 Gesture · 动作工作台</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/styles.css?v=__GUI_REVISION__" />
+    <script defer src="/vendor/lucide.min.js?v=__GUI_REVISION__"></script>
+    <script defer src="/vendor/chart.umd.js?v=__GUI_REVISION__"></script>
+    <script
+      defer
+      src="/app.js?v=__GUI_REVISION__"
+      data-ui-revision="__GUI_REVISION__"
+    ></script>
+  </head>
+  <body>
+    <aside class="device-sidebar">
+      <a class="brand" href="/" aria-label="DM-MC02 Gesture 首页"
+        ><span class="brand-mark"><i data-lucide="wand-sparkles"></i></span
+        ><span>DM-MC02<span class="brand-caption">GESTURE LAB</span></span></a
+      >
+      <div class="sidebar-section-title">
+        <span>设备连接</span
+        ><span id="connection-dot" class="connection-dot"></span>
+      </div>
+      <label class="field-label" for="port-select">串口</label>
+      <div class="port-control">
+        <select id="port-select">
+          <option value="">正在查找设备...</option></select
+        ><button
+          id="refresh-ports"
+          class="icon-button dark"
+          title="刷新串口"
+          aria-label="刷新串口"
+        >
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </div>
+      <button id="connect-button" class="button primary full-width">
+        <i data-lucide="plug"></i><span>连接设备</span>
+      </button>
+      <button id="demo-button" class="button sidebar-secondary full-width">
+        <i data-lucide="play"></i><span>演示设备</span>
+      </button>
+      <div id="port-description" class="port-description">未连接设备</div>
+      <div id="firmware-version" class="firmware-version">固件版本未读取</div>
+      <div class="sidebar-divider"></div>
+      <div class="sidebar-section-title" id="board-controls-heading">
+        板端控制
+      </div>
+      <div class="switch-line" id="armed-control">
+        <span><i data-lucide="scan-line"></i>动作识别</span
+        ><label class="switch"
+          ><input
+            id="armed-toggle"
+            type="checkbox"
+            aria-label="启用动作识别"
+            disabled /><span></span
+        ></label>
+      </div>
+      <div class="switch-line" id="hotkeys-control">
+        <span><i data-lucide="keyboard"></i>电脑快捷键</span
+        ><label class="switch"
+          ><input
+            id="hotkeys-toggle"
+            type="checkbox"
+            aria-label="启用电脑快捷键"
+            disabled /><span></span
+        ></label>
+      </div>
+      <button
+        id="calibrate-button"
+        class="button sidebar-secondary full-width"
+        disabled
+      >
+        <i data-lucide="focus"></i><span>陀螺仪校准</span>
+      </button>
+      <div class="calibration-state">
+        <span id="calibration-dot" class="mini-dot"></span
+        ><span id="calibration-text">等待连接</span>
+      </div>
+      <div class="sidebar-bottom">
+        <img
+          class="board-photo"
+          src="/board.png"
+          alt="DM-MC02 开发板"
+          width="156"
+          height="108"
+        />
+        <div class="device-name">DM-MC02 <span>六轴运动控制器</span></div>
+        <div class="device-foot">
+          <span id="protocol-label">USB · CDC</span
+          ><span class="rgb-dots"><b></b><b></b><b></b></span>
+        </div>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">DM-MC02 GESTURE</div>
+          <h1>动作工作台</h1>
+        </div>
+        <div class="connection-summary">
+          <span id="demo-badge" class="badge demo" hidden>演示</span
+          ><span id="connection-badge" class="badge neutral"
+            ><span class="mini-dot"></span>未连接</span
+          ><button
+            id="status-button"
+            class="icon-button"
+            title="刷新设备状态"
+            aria-label="刷新设备状态"
+            disabled
+          >
+            <i data-lucide="refresh-cw"></i></button
+          ><button
+            id="stop-button"
+            class="button emergency"
+            title="停止学习、识别和电脑快捷键"
+            disabled
+          >
+            <i data-lucide="circle-stop"></i>停止
+          </button>
+        </div>
+      </header>
+      <div id="connection-error" class="error-banner" role="alert" hidden></div>
+      <div
+        id="firmware-warning"
+        class="firmware-warning"
+        role="status"
+        hidden
+      ></div>
+      <div class="metrics">
+        <div class="metric">
+          <span class="metric-label">已保存动作</span
+          ><span class="metric-value" id="metric-classes"
+            >—<small> / 8</small></span
+          >
+        </div>
+        <div class="metric">
+          <span class="metric-label">识别状态</span
+          ><span class="metric-value text-value" id="metric-armed"
+            >等待连接</span
+          >
+        </div>
+        <div class="metric">
+          <span class="metric-label">最近识别</span
+          ><span
+            class="metric-value text-value last-recognition"
+            id="metric-last"
+            ><span id="last-color" class="color-swatch" hidden></span
+            ><span id="last-name">—</span></span
+          >
+        </div>
+        <div class="metric">
+          <span class="metric-label">最大算法耗时</span
+          ><span class="metric-value" id="metric-latency"
+            >—<small> μs</small></span
+          >
+        </div>
+      </div>
+      <div class="live-match-bar" aria-live="polite">
+        <span id="live-match-label" class="muted">运动中匹配 · RGB</span>
+        <span class="live-match-result"
+          ><span id="live-match-color" class="color-swatch" hidden></span
+          ><strong id="live-match-name">等待连接</strong></span
+        >
+        <span id="live-match-distance" class="muted"></span>
+      </div>
+      <nav class="tabs" aria-label="工作台视图">
+        <button class="tab active" data-tab="library" aria-selected="true">
+          <i data-lucide="layers-3"></i>动作库<span>8</span>
+        </button>
+        <button class="tab" data-tab="live" aria-selected="false">
+          <i data-lucide="activity"></i>实时数据
+        </button>
+        <button class="tab" data-tab="spatial" aria-selected="false">
+          <i data-lucide="move-3d"></i>空间姿态
+        </button>
+        <button class="tab" data-tab="pen" aria-selected="false">
+          <i data-lucide="pen-line"></i>空中画笔
+        </button>
+        <button class="tab" data-tab="capture" aria-selected="false">
+          <i data-lucide="folder-open"></i>采集记录
+        </button>
+      </nav>
+
+      <section id="view-library" class="tab-view active" aria-label="动作库">
+        <div class="library-layout">
+          <section class="library-section">
+            <div class="section-heading">
+              <h2>动作槽位</h2>
+              <span id="library-note" class="muted">等待设备同步</span>
+            </div>
+            <div class="table-scroll">
+              <table class="slot-table">
+                <thead>
+                  <tr>
+                    <th class="slot-number">槽位</th>
+                    <th>动作名称</th>
+                    <th>示范 / 状态</th>
+                    <th>电脑快捷键</th>
+                    <th class="actions-heading">操作</th>
+                  </tr>
+                </thead>
+                <tbody id="slot-rows"></tbody>
+              </table>
+            </div>
+          </section>
+          <aside class="training-section" aria-label="现场学习">
+            <div class="section-heading">
+              <h2>现场学习</h2>
+              <span class="slot-tag" id="selected-slot">01</span>
+            </div>
+            <div class="training-title" id="training-title">动作 01</div>
+            <div class="training-status" id="training-status">
+              <i data-lucide="circle-dashed"></i><span>等待连接设备</span>
+            </div>
+            <div class="sample-progress" aria-label="示范录制进度">
+              <div class="sample-step" data-step="1">
+                <span>1</span><small>示范一</small>
+              </div>
+              <div class="sample-step" data-step="2">
+                <span>2</span><small>示范二</small>
+              </div>
+              <div class="sample-step" data-step="3">
+                <span>3</span><small>示范三</small>
+              </div>
+            </div>
+            <div class="training-count">
+              <span id="training-count">0</span
+              ><span id="training-count-label"> / 3 次示范</span>
+            </div>
+            <div
+              id="training-message"
+              class="training-message"
+              aria-live="polite"
+            >
+              未开始录制
+            </div>
+            <div
+              id="training-warning"
+              class="firmware-warning"
+              role="status"
+              hidden
+            ></div>
+            <button
+              id="learn-button"
+              class="button primary full-width"
+              disabled
+            >
+              <i data-lucide="circle-dot"></i><span>准备学习</span>
+            </button>
+            <button
+              id="demo-key-button"
+              class="button demo-record full-width"
+              type="button"
+              aria-pressed="false"
+              hidden
+              disabled
+            >
+              <i data-lucide="hand"></i><span>按住录制 · 演示</span>
+            </button>
+            <div class="training-actions">
+              <button id="save-button" class="button primary" disabled>
+                <i data-lucide="save"></i>保存动作</button
+              ><button id="cancel-button" class="button secondary" disabled>
+                <i data-lucide="x"></i>取消
+              </button>
+            </div>
+            <div class="training-detail">
+              <div><span>模板保存位置</span><strong>板载 Flash</strong></div>
+              <div>
+                <span>当前动作模板</span
+                ><strong id="training-template-count">未同步</strong>
+              </div>
+              <div>
+                <span>设备校准</span
+                ><strong id="training-calibration">未连接</strong>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section id="view-live" class="tab-view" aria-label="实时数据" hidden>
+        <div class="section-heading live-heading">
+          <h2>六轴运动数据</h2>
+          <span class="stream-indicator"
+            ><span class="mini-dot" id="stream-dot"></span
+            ><span id="stream-status">等待数据</span></span
+          >
+        </div>
+        <div class="live-stats">
+          <div><span>接收样本</span><strong id="stat-samples">—</strong></div>
+          <div>
+            <span>采样丢失</span><strong id="stat-sample-drops">—</strong>
+          </div>
+          <div><span>USB 丢包</span><strong id="stat-usb-drops">—</strong></div>
+          <div>
+            <span>IMU 错误</span><strong id="stat-imu-errors">—</strong>
+          </div>
+          <div><span>拒绝次数</span><strong id="stat-unknown">—</strong></div>
+        </div>
+        <div class="chart-section">
+          <div class="chart-heading">
+            <h3>加速度</h3>
+            <span>m/s²</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="accel-chart" aria-label="XYZ 三轴加速度曲线"></canvas>
+            <div class="chart-empty" id="accel-empty">暂无运动数据</div>
+          </div>
+        </div>
+        <div class="chart-section">
+          <div class="chart-heading">
+            <h3>角速度</h3>
+            <span>rad/s</span>
+          </div>
+          <div class="chart-wrap">
+            <canvas id="gyro-chart" aria-label="XYZ 三轴角速度曲线"></canvas>
+            <div class="chart-empty" id="gyro-empty">暂无运动数据</div>
+          </div>
+        </div>
+      </section>
+
+      <section id="view-spatial" class="tab-view" aria-label="空间姿态" hidden>
+        <div class="section-heading spatial-heading">
+          <h2>空间轨迹与姿态</h2>
+          <div class="spatial-tools">
+            <span id="pose-status" class="badge neutral">等待 IMU 数据</span>
+            <button
+              id="pose-origin-button"
+              class="icon-button"
+              title="将当前位置和姿态设为原点"
+              aria-label="将当前位置和姿态设为原点"
+              disabled
+            >
+              <i data-lucide="locate-fixed"></i>
+            </button>
+            <button
+              id="pose-camera-button"
+              class="icon-button"
+              title="重置视角"
+              aria-label="重置视角"
+              disabled
+            >
+              <i data-lucide="rotate-ccw"></i>
+            </button>
+            <button
+              id="pose-trail-button"
+              class="icon-button active"
+              title="显示运动轨迹"
+              aria-label="显示运动轨迹"
+              aria-pressed="true"
+              disabled
+            >
+              <i data-lucide="route"></i>
+            </button>
+          </div>
+        </div>
+        <div class="pose-metrics">
+          <div>
+            <span class="pose-label axis-x">X <small>m</small></span
+            ><strong id="pose-x">—</strong>
+          </div>
+          <div>
+            <span class="pose-label axis-y">Y <small>m</small></span
+            ><strong id="pose-y">—</strong>
+          </div>
+          <div>
+            <span class="pose-label axis-z">Z <small>m</small></span
+            ><strong id="pose-z">—</strong>
+          </div>
+          <div>
+            <span class="pose-label">Roll <small>°</small></span
+            ><strong id="pose-roll">—</strong>
+          </div>
+          <div>
+            <span class="pose-label">Pitch <small>°</small></span
+            ><strong id="pose-pitch">—</strong>
+          </div>
+          <div>
+            <span class="pose-label">Yaw <small>°</small></span
+            ><strong id="pose-yaw">—</strong>
+          </div>
+        </div>
+        <div
+          id="pose-range-warning"
+          class="pose-range-warning"
+          role="status"
+          hidden
+        >
+          位移超出估计范围，请归零
+        </div>
+        <div
+          id="spatial-scene"
+          class="spatial-scene"
+          aria-label="固定参考坐标系中的三维运动轨迹"
+        >
+          <div id="spatial-loading" class="spatial-message">
+            正在加载三维视图...
+          </div>
+          <div id="spatial-waiting" class="spatial-waiting" hidden>
+            等待 IMU 数据
+          </div>
+        </div>
+        <div class="pose-measurement-footer">
+          <span>IMU 相对估计 · 位置会漂移 · 航向无绝对参考</span
+          ><span id="pose-motion-detail">未接收姿态数据</span>
+        </div>
+      </section>
+
+      <section id="view-pen" class="tab-view" aria-label="空中画笔" hidden>
+        <div class="section-heading pen-heading">
+          <div class="pen-heading-title">
+            <h2>3D 空中画笔</h2>
+            <span id="pen-status" class="badge neutral" role="status"
+              >待机</span
+            >
+          </div>
+          <button
+            id="pen-demo-key"
+            class="button secondary"
+            hidden
+            disabled
+            aria-pressed="false"
+          >
+            <i data-lucide="circle-dot"></i><span>模拟 KEY</span>
+          </button>
+        </div>
+        <div class="pen-toolbar" aria-label="画笔工具">
+          <div class="pen-tool-group pen-colors" role="group" aria-label="笔色">
+            <button
+              class="pen-color"
+              data-pen-color="#252a2c"
+              title="墨黑"
+              aria-label="墨黑"
+              aria-pressed="true"
+            ></button>
+            <button
+              class="pen-color"
+              data-pen-color="#067b70"
+              title="青绿"
+              aria-label="青绿"
+              aria-pressed="false"
+            ></button>
+            <button
+              class="pen-color"
+              data-pen-color="#cf534e"
+              title="朱红"
+              aria-label="朱红"
+              aria-pressed="false"
+            ></button>
+            <button
+              class="pen-color"
+              data-pen-color="#397fc5"
+              title="蓝色"
+              aria-label="蓝色"
+              aria-pressed="false"
+            ></button>
+            <button
+              class="pen-color"
+              data-pen-color="#8557b5"
+              title="紫色"
+              aria-label="紫色"
+              aria-pressed="false"
+            ></button>
+            <button
+              class="pen-color"
+              data-pen-color="#d88933"
+              title="橙色"
+              aria-label="橙色"
+              aria-pressed="false"
+            ></button>
+          </div>
+          <div class="pen-tool-group pen-settings">
+            <label class="pen-range" for="pen-width">
+              <span>笔宽</span
+              ><input
+                id="pen-width"
+                type="range"
+                min="1"
+                max="12"
+                step="1"
+                value="3"
+              /><output id="pen-width-value" for="pen-width">3 mm</output>
+            </label>
+            <label class="pen-range" for="pen-sensitivity">
+              <span>视图缩放</span
+              ><input
+                id="pen-sensitivity"
+                type="range"
+                min="0.5"
+                max="3"
+                step="0.1"
+                value="1"
+              /><output id="pen-sensitivity-value" for="pen-sensitivity"
+                >1.0</output
+              >
+            </label>
+          </div>
+          <div
+            class="pen-tool-group pen-edit-tools"
+            role="group"
+            aria-label="笔记操作"
+          >
+            <button
+              id="pen-undo"
+              class="icon-button"
+              title="撤销上一笔"
+              aria-label="撤销上一笔"
+              disabled
+            >
+              <i data-lucide="undo-2"></i>
+            </button>
+            <button
+              id="pen-redo"
+              class="icon-button"
+              title="重做上一笔"
+              aria-label="重做上一笔"
+              disabled
+            >
+              <i data-lucide="redo-2"></i>
+            </button>
+            <button
+              id="pen-center"
+              class="icon-button"
+              title="显示全部笔迹"
+              aria-label="显示全部笔迹"
+            >
+              <i data-lucide="scan"></i>
+            </button>
+            <button
+              id="pen-clear"
+              class="icon-button"
+              title="清空笔记"
+              aria-label="清空笔记"
+              disabled
+            >
+              <i data-lucide="trash-2"></i>
+            </button>
+            <button
+              id="pen-export"
+              class="icon-button"
+              title="导出 PNG"
+              aria-label="导出 PNG"
+              disabled
+            >
+              <i data-lucide="download"></i>
+            </button>
+            <button
+              id="pen-export-json"
+              class="icon-button"
+              title="导出 3D 数据"
+              aria-label="导出 3D 数据"
+              disabled
+            >
+              <i data-lucide="file-json-2"></i>
+            </button>
+          </div>
+        </div>
+        <div class="pen-canvas-wrap">
+          <canvas
+            id="air-pen-canvas"
+            width="1600"
+            height="1000"
+            aria-label="空中画笔三维笔迹"
+          ></canvas>
+          <div class="pen-axis-legend" aria-label="三维坐标轴">
+            <span class="pen-axis-x">X</span><span class="pen-axis-y">Y</span
+            ><span class="pen-axis-z">Z</span>
+          </div>
+        </div>
+        <div class="pen-footer">
+          <span id="pen-detail" role="status">等待设备数据</span>
+          <div class="pen-document-status">
+            <span id="pen-position-detail">世界参考坐标 · 相对位移</span
+            ><span id="pen-stroke-count">0 笔 · 0 点</span
+            ><span id="pen-draft-status">空白笔记</span>
+          </div>
+        </div>
+        <dialog id="pen-clear-dialog" aria-labelledby="pen-clear-heading">
+          <div class="dialog-symbol"><i data-lucide="trash-2"></i></div>
+          <h2 id="pen-clear-heading">清空这页笔记？</h2>
+          <p>当前所有笔迹将被清除。</p>
+          <div class="dialog-actions">
+            <button id="pen-clear-cancel" class="button secondary">取消</button>
+            <button id="pen-clear-confirm" class="button danger">
+              <i data-lucide="trash-2"></i>清空笔记
+            </button>
+          </div>
+        </dialog>
+      </section>
+
+      <section id="view-capture" class="tab-view" aria-label="采集记录" hidden>
+        <div class="section-heading">
+          <h2>数据采集</h2>
+          <span class="badge neutral" id="capture-badge">未采集</span>
+        </div>
+        <form id="capture-form" class="capture-form">
+          <label
+            >用户<input
+              name="user"
+              id="capture-user"
+              value="u01"
+              required
+              maxlength="64" /></label
+          ><label
+            >会话<input
+              name="session"
+              id="capture-session"
+              required
+              maxlength="64" /></label
+          ><label
+            >动作标签<input
+              name="label"
+              id="capture-label"
+              value="unknown"
+              required
+              maxlength="64" /></label
+          ><label
+            >动作速度<select name="speed" id="capture-speed">
+              <option value="normal">正常</option>
+              <option value="slow">慢速</option>
+              <option value="fast">快速</option>
+              <option value="unknown">未指定</option>
+            </select></label
+          ><button
+            id="capture-button"
+            type="submit"
+            class="button primary"
+            disabled
+          >
+            <i data-lucide="circle-dot"></i><span>开始采集</span>
+          </button>
+        </form>
+        <div id="capture-current" class="capture-current" hidden>
+          <span class="recording-dot"></span
+          ><span id="capture-current-text"></span>
+        </div>
+        <div class="section-heading capture-list-heading">
+          <h2>本地记录</h2>
+          <button
+            id="refresh-captures"
+            class="icon-button"
+            title="刷新采集记录"
+            aria-label="刷新采集记录"
+          >
+            <i data-lucide="refresh-cw"></i>
+          </button>
+        </div>
+        <div id="capture-list" class="capture-list">
+          <div class="empty-state">
+            <i data-lucide="folder-open"></i><span>暂无采集记录</span>
+          </div>
+        </div>
+      </section>
+
+      <section class="event-section" aria-label="设备事件">
+        <div class="section-heading">
+          <h2>设备事件<span id="event-count" class="count-label">0</span></h2>
+          <button
+            id="clear-events"
+            class="icon-button"
+            title="清空当前事件列表"
+            aria-label="清空当前事件列表"
+          >
+            <i data-lucide="list-x"></i>
+          </button>
+        </div>
+        <div id="event-list" class="event-list" aria-live="polite">
+          <div class="event-empty">暂无事件</div>
+        </div>
+      </section>
+      <footer class="workspace-footer">
+        <span>板端学习 · 本地连接</span><span id="footer-status">等待设备</span>
+      </footer>
+    </main>
+    <div id="toast" class="toast" role="status" hidden></div>
+    <dialog id="delete-dialog">
+      <form method="dialog">
+        <div class="dialog-symbol"><i data-lucide="trash-2"></i></div>
+        <h2>删除这个动作？</h2>
+        <p id="delete-description"></p>
+        <div id="delete-wait" class="muted"></div>
+        <div class="dialog-actions">
+          <button id="delete-cancel" value="cancel" class="button secondary">
+            取消</button
+          ><button
+            id="delete-confirm"
+            type="button"
+            class="button danger"
+            disabled
+          >
+            <i data-lucide="trash-2"></i>确认删除
+          </button>
+        </div>
+      </form>
+    </dialog>
+  </body>
+</html>

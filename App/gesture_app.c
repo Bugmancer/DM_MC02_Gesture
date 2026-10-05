@@ -1,0 +1,630 @@
+#include "gesture_app.h"
+#include "gesture_usb.h"
+#include "gesture_board.h"
+#include "gesture_engine.h"
+#include "display.h"
+#include "main.h"
+#include "tim.h"
+#include <stdio.h>
+#include <string.h>
+
+static ge_engine_t engine;
+static display_view_t view;
+static uint8_t model_blob[GE_MODEL_BLOB_MAX];
+static uint8_t rollback_blob[GE_MODEL_BLOB_MAX];
+static volatile uint32_t sample_ticks;
+static uint32_t processed_ticks, ready_mask, samples, sample_drops, imu_errors;
+static uint32_t unknown_count, recognized_count, max_feed_cycles, max_read_cycles;
+static uint32_t last_view_ms, last_status_ms, last_key_ms, transient_until;
+static uint8_t selected, armed, training, calibrated, stream_raw, delete_confirm;
+static uint8_t consecutive_errors;
+static uint8_t user_was_down, capture_key_ready, capture_held, capture_interrupted;
+static uint32_t capture_release_since;
+static uint32_t last_rgb = 0xffffffffu;
+static uint32_t rgb_match_until;
+static uint8_t rgb_match_slot = GE_CLASS_NONE;
+
+static void engine_events(uint32_t now);
+static void update_rgb(uint32_t now);
+
+static void show_match_rgb(uint8_t slot, uint32_t now, uint32_t hold_ms)
+{
+    if (slot >= GE_MAX_CLASSES) return;
+    /* Preview refreshes cannot shorten the longer accepted-event indication. */
+    if (slot != rgb_match_slot || (int32_t)(rgb_match_until - now) < (int32_t)hold_ms)
+        rgb_match_until = now + hold_ms;
+    rgb_match_slot = slot;
+    update_rgb(now);
+}
+
+static void report_firmware(void)
+{
+    gesture_usb_log(0, "FIRMWARE,gesture-20261005-r6,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY\r\n");
+}
+
+static void report_capture(void)
+{
+    if (training) gesture_usb_log(0, "CAPTURE,MODE,KEY\r\nCAPTURE,%s,%u\r\n",
+        capture_held ? "BEGIN" : "WAIT", (unsigned)selected + 1u);
+    else gesture_usb_log(0, "CAPTURE,MODE,KEY\r\n");
+}
+
+static void message(const char *text)
+{
+    (void)snprintf(view.message, sizeof(view.message), "%s", text);
+}
+
+static void reset_stream(void)
+{
+    processed_ticks = sample_ticks;
+    rgb_match_slot = GE_CLASS_NONE;
+    ge_reset_stream(&engine);
+}
+
+static void disarm(void)
+{
+    armed = 0u;
+    ge_set_recognition(&engine, 0);
+    reset_stream();
+    gesture_usb_log(0, "STATE,IDLE\r\n");
+}
+
+static void cancel(void)
+{
+    if (capture_held) gesture_usb_log(0, "CAPTURE,END,%u\r\n", (unsigned)selected + 1u);
+    capture_held = capture_interrupted = capture_key_ready = 0u;
+    ge_train_cancel(&engine);
+    training = delete_confirm = 0u;
+    disarm();
+    transient_until = 0u;
+    view.state = DISPLAY_STATE_IDLE;
+    message("Ready");
+}
+
+static void update_view(void)
+{
+    uint8_t i;
+    view.selected_slot = selected;
+    view.learning_count = ge_training_progress(&engine);
+    view.learning_target = GE_TEMPLATES_PER_CLASS;
+    view.imu_ok = (uint8_t)((ready_mask & BOARD_READY_IMU) && !consecutive_errors);
+    view.flash_ok = (uint8_t)((ready_mask & BOARD_READY_FLASH) != 0u);
+    view.power_ok = 1u; /* Running from the system rail; no battery gauge is fitted here. */
+    view.rejected_count = unknown_count;
+    view.sample_drops = sample_drops;
+    for (i = 0; i < GE_MAX_CLASSES; ++i) {
+        const ge_class_t *c = ge_class_get(&engine, i);
+        view.slot_templates[i] = c ? c->template_count : 0u;
+    }
+    display_set_view(&view);
+}
+
+static void startup_paint(uint32_t duration_ms)
+{
+    uint32_t start = HAL_GetTick();
+    update_view();
+    while ((uint32_t)(HAL_GetTick() - start) < duration_ms) display_process();
+}
+
+static void calibrate(void)
+{
+    if (!(ready_mask & BOARD_READY_IMU)) {
+        message("IMU missing. Check board and reset");
+        gesture_usb_log(0, "ERROR,CALIBRATE,IMU_UNAVAILABLE\r\n");
+        return;
+    }
+    cancel();
+    (void)HAL_TIM_Base_Stop_IT(&htim7);
+    message("Lay flat: calibrating gyro");
+    startup_paint(120u);
+    calibrated = (uint8_t)board_calibrate_gyro(1500u);
+    reset_stream();
+    message(calibrated ? "Calibrated. Select an empty slot" : "Calibration failed; learning available");
+    view.state = calibrated ? DISPLAY_STATE_IDLE : DISPLAY_STATE_ERROR;
+    gesture_usb_log(0, "CALIBRATION,%s\r\n", calibrated ? "OK" : "FAILED");
+    if (!calibrated) gesture_usb_log(0, "ERROR,CALIBRATE,NOT_STILL\r\n");
+    if (HAL_TIM_Base_Start_IT(&htim7) != HAL_OK) {
+        ready_mask &= ~BOARD_READY_IMU;
+        message("Sample timer failed");
+        view.state = DISPLAY_STATE_ERROR;
+        gesture_usb_log(0, "ERROR,CALIBRATE,TIMER_FAILED\r\n");
+    }
+}
+
+static void set_armed(int enable)
+{
+    if (!enable) { cancel(); return; }
+    if (!(ready_mask & BOARD_READY_IMU) || consecutive_errors >= 3u) {
+        message("IMU missing. Check board and reset");
+        gesture_usb_log(0, "ERROR,ARM,IMU_UNAVAILABLE\r\n");
+        return;
+    }
+    if (training || delete_confirm) {
+        message("Finish or cancel learning first");
+        gesture_usb_log(0, "ERROR,ARM,BUSY\r\n");
+        return;
+    }
+    if (!ge_class_count(&engine)) {
+        message("No saved gestures. OK to learn");
+        gesture_usb_log(0, "ERROR,ARM,NO_GESTURES\r\n");
+        return;
+    }
+    reset_stream();
+    armed = 1u;
+    ge_set_recognition(&engine, 1);
+    transient_until = 0u;
+    view.state = DISPLAY_STATE_ARMED;
+    message("Recognition enabled");
+    gesture_usb_log(0, "STATE,ARMED\r\n");
+}
+
+static void begin_learning(uint8_t slot)
+{
+    ge_status_t status;
+    char name[GE_NAME_BYTES];
+    if (training || delete_confirm) {
+        message("Finish or cancel current operation");
+        gesture_usb_log(0, "ERROR,LEARN,BUSY\r\n");
+        return;
+    }
+    if (!(ready_mask & BOARD_READY_IMU) || consecutive_errors >= 3u) {
+        message("IMU unavailable. Check board and reset");
+        gesture_usb_log(0, "ERROR,LEARN,IMU_UNAVAILABLE\r\n");
+        return;
+    }
+    if (!(ready_mask & BOARD_READY_FLASH)) {
+        message("Flash unavailable. Cannot save");
+        gesture_usb_log(0, "ERROR,LEARN,FLASH_UNAVAILABLE\r\n");
+        return;
+    }
+    disarm();
+    (void)snprintf(name, sizeof(name), "Gesture %u", (unsigned)slot + 1u);
+    status = ge_train_begin_at(&engine, slot, name);
+    if (status != GE_OK) {
+        view.state = DISPLAY_STATE_IDLE;
+        message(ge_status_string(status));
+        gesture_usb_log(0, "ERROR,LEARN,%s\r\n", ge_status_string(status));
+        return;
+    }
+    selected = slot;
+    training = 1u;
+    capture_held = capture_interrupted = capture_key_ready = 0u;
+    user_was_down = board_user_key_down();
+    capture_release_since = HAL_GetTick();
+    transient_until = 0u;
+    view.state = DISPLAY_STATE_LEARNING;
+    message(user_was_down ? "RELEASE KEY, then HOLD to record" : "HOLD KEY, move, RELEASE KEY");
+    gesture_usb_log(0, "TRAIN,BEGIN,%u\r\n", (unsigned)slot + 1u);
+    report_capture();
+}
+
+static void request_delete(uint8_t slot)
+{
+    if (training) {
+        message("Finish or cancel learning first");
+        gesture_usb_log(0, "ERROR,DELETE,BUSY\r\n");
+        return;
+    }
+    if (!ge_class_get(&engine, slot)) {
+        message("No saved gesture at this slot");
+        gesture_usb_log(0, "ERROR,DELETE,SLOT_EMPTY\r\n");
+        return;
+    }
+    disarm();
+    selected = slot;
+    delete_confirm = 1u;
+    transient_until = 0u;
+    view.state = DISPLAY_STATE_CONFIRM;
+    message("Delete slot? OK confirm, DOWN cancel");
+    gesture_usb_log(0, "DELETE,CONFIRM,%u\r\n", (unsigned)slot + 1u);
+}
+
+static void save_model(void)
+{
+    size_t old_size, new_size;
+    uint8_t id = selected;
+    ge_status_t status;
+    int deleting = delete_confirm != 0u;
+    const char *operation = deleting ? "DELETE" : "SAVE";
+    if ((!training || !ge_training_ready(&engine) || capture_held) && !deleting) {
+        message(capture_held ? "Release KEY before saving" : "One accepted demo required");
+        gesture_usb_log(0, "ERROR,SAVE,NOT_READY\r\n");
+        return;
+    }
+    if (!(ready_mask & BOARD_READY_FLASH)) {
+        message("Flash unavailable");
+        gesture_usb_log(0, "ERROR,%s,FLASH_UNAVAILABLE\r\n", operation);
+        return;
+    }
+    old_size = ge_model_export(&engine, rollback_blob, sizeof(rollback_blob));
+    if (!old_size) {
+        message("Model backup failed");
+        gesture_usb_log(0, "ERROR,%s,BACKUP_FAILED\r\n", operation);
+        return;
+    }
+    (void)HAL_TIM_Base_Stop_IT(&htim7);
+    ge_reset_stream(&engine);
+    view.state = DISPLAY_STATE_SAVING;
+    message("Writing templates to Flash");
+    startup_paint(80u);
+    status = deleting ? ge_class_delete(&engine, selected) : ge_train_confirm(&engine, &id);
+    new_size = status == GE_OK ? ge_model_export(&engine, model_blob, sizeof(model_blob)) : 0u;
+    if (new_size && board_store_save(model_blob, (uint32_t)new_size)) {
+        message(deleting ? "Deleted. Recognition disabled" : "Saved. UP enables recognition");
+        gesture_usb_log(0, "%s,%u,%lu\r\n", deleting ? "DELETED" : "SAVED",
+                        (unsigned)id + 1u, (unsigned long)new_size);
+        view.state = DISPLAY_STATE_IDLE;
+    } else {
+        ge_train_cancel(&engine);
+        ge_reset_stream(&engine);
+        (void)ge_model_import(&engine, rollback_blob, old_size);
+        message("Save failed. Previous model restored");
+        gesture_usb_log(0, "ERROR,SAVE_ROLLED_BACK\r\n");
+        gesture_usb_log(0, "ERROR,%s,ROLLED_BACK\r\n", operation);
+        view.state = DISPLAY_STATE_ERROR;
+    }
+    ge_train_cancel(&engine);
+    training = delete_confirm = 0u;
+    disarm();
+    if (HAL_TIM_Base_Start_IT(&htim7) != HAL_OK) {
+        ready_mask &= ~BOARD_READY_IMU;
+        message("Sample timer failed");
+        view.state = DISPLAY_STATE_ERROR;
+        gesture_usb_log(0, "ERROR,%s,TIMER_FAILED\r\n", operation);
+    }
+}
+
+static void key_event(BoardKey key)
+{
+    switch (key) {
+    case BOARD_KEY_LEFT:
+    case BOARD_KEY_RIGHT:
+        if (!training && !delete_confirm) selected = (uint8_t)((selected + (key == BOARD_KEY_RIGHT ? 1u : 7u)) % 8u);
+        break;
+    case BOARD_KEY_UP: set_armed(!armed); break;
+    case BOARD_KEY_USER: break; /* USER press/release is handled together below. */
+    case BOARD_KEY_DOWN: cancel(); break;
+    case BOARD_KEY_OK:
+        if (delete_confirm || (training && ge_training_ready(&engine))) save_model();
+        else if (!training && ge_class_get(&engine, selected)) request_delete(selected);
+        else if (!training) begin_learning(selected);
+        break;
+    default: break;
+    }
+}
+
+static void user_key_process(uint32_t now)
+{
+    uint8_t down = board_user_key_down();
+    uint8_t pressed = (uint8_t)(down && !user_was_down);
+    uint8_t released = (uint8_t)(!down && user_was_down);
+    ge_status_t status;
+    user_was_down = down;
+    if (!training) return;
+    /* A released baseline longer than hardware debounce excludes a key that
+       was already held (including a pending press) when learning began. */
+    if (down) capture_release_since = now;
+    else if ((uint32_t)(now - capture_release_since) >= 50u) capture_key_ready = 1u;
+    if (pressed && capture_key_ready && ge_training_progress(&engine) < GE_TEMPLATES_PER_CLASS) {
+        capture_key_ready = 0u;
+        status = ge_train_capture_begin(&engine, now);
+        if (status == GE_OK) {
+            capture_held = 1u;
+            capture_interrupted = 0u;
+            view.state = DISPLAY_STATE_LEARNING;
+            message("Recording. RELEASE KEY when done");
+            gesture_usb_log(0, "CAPTURE,BEGIN,%u\r\n", (unsigned)selected + 1u);
+        } else {
+            message("Release KEY, then retry recording");
+            gesture_usb_log(0, "TRAIN,REJECT,%s\r\n", ge_status_string(status));
+            gesture_usb_log(0, "CAPTURE,WAIT,%u\r\n", (unsigned)selected + 1u);
+        }
+    }
+    if (released && capture_held) {
+        capture_held = 0u;
+        gesture_usb_log(0, "CAPTURE,END,%u\r\n", (unsigned)selected + 1u);
+        status = ge_train_capture_end(&engine, now);
+        engine_events(now);
+        if (status == GE_ERR_NOT_READY) {
+            view.state = ge_training_ready(&engine) ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
+            message("Capture interrupted. HOLD KEY to retry");
+            gesture_usb_log(0, "TRAIN,REJECT,%s\r\n",
+                capture_interrupted ? "SAMPLE GAP" : ge_status_string(status));
+        }
+        capture_interrupted = 0u;
+        if (ge_training_progress(&engine) < GE_TEMPLATES_PER_CLASS)
+            gesture_usb_log(0, "CAPTURE,WAIT,%u\r\n", (unsigned)selected + 1u);
+    }
+}
+
+static void report_status(void)
+{
+    unsigned long mhz = (unsigned long)(SystemCoreClock / 1000000u);
+    report_firmware();
+    gesture_usb_log(0, "STATUS,%lu,%u,%u,%u,%lu,%lu,%lu,%lu,%lu,%lu,%lu\r\n",
+        (unsigned long)HAL_GetTick(), armed, ge_class_count(&engine), calibrated,
+        (unsigned long)samples, (unsigned long)sample_drops, (unsigned long)imu_errors,
+        (unsigned long)unknown_count, (unsigned long)gesture_usb_drops(),
+        (unsigned long)(max_feed_cycles / mhz), (unsigned long)(max_read_cycles / mhz));
+}
+
+static void report_inventory(void)
+{
+    unsigned slot, offset = 0u;
+    char lines[160];
+    report_firmware();
+    gesture_usb_log(0, "INFO,1,%lu,%u,%u,%u,%u,%u,%u\r\n",
+        (unsigned long)ready_mask, (unsigned)display_is_ok(), training,
+        (unsigned)selected + 1u, (unsigned)ge_training_progress(&engine),
+        (unsigned)ge_training_ready(&engine), delete_confirm);
+    for (slot = 0u; slot < GE_MAX_CLASSES; ++slot) {
+        const ge_class_t *c = ge_class_get(&engine, (uint8_t)slot);
+        char name[GE_NAME_BYTES];
+        unsigned i = 0u;
+        if (c) {
+            while (i < sizeof(name) - 1u && c->name[i]) {
+                unsigned char ch = (unsigned char)c->name[i];
+                name[i++] = (ch >= 32u && ch <= 126u && ch != ',') ? (char)ch : '_';
+            }
+        }
+        name[i] = '\0';
+        offset += (unsigned)snprintf(lines + offset, sizeof(lines) - offset,
+            "SLOT,%u,%u,%s\r\n", slot + 1u, c ? (unsigned)c->template_count : 0u, name);
+        /* Four CSV lines share a queue entry, leaving room for control events. */
+        if ((slot + 1u) % 4u == 0u || slot + 1u == GE_MAX_CLASSES) {
+            gesture_usb_log(0, "%s", lines);
+            offset = 0u;
+        }
+    }
+    report_capture();
+}
+
+static void command(const char *line)
+{
+    unsigned slot;
+    char extra;
+    if (!strcmp(line, "status")) report_status();
+    else if (!strcmp(line, "list")) report_inventory();
+    else if (!strcmp(line, "arm")) set_armed(1);
+    else if (!strcmp(line, "disarm") || !strcmp(line, "cancel")) cancel();
+    else if (!strcmp(line, "save")) save_model();
+    else if (!strcmp(line, "calibrate")) calibrate();
+    else if (!strcmp(line, "stream 1")) { stream_raw = 1u; gesture_usb_log(0, "STREAM,1\r\n"); }
+    else if (!strcmp(line, "stream 0")) { stream_raw = 0u; gesture_usb_log(0, "STREAM,0\r\n"); }
+    else if (sscanf(line, "learn %u %c", &slot, &extra) == 1 && slot >= 1u && slot <= 8u) begin_learning((uint8_t)(slot - 1u));
+    else if (sscanf(line, "delete %u %c", &slot, &extra) == 1 && slot >= 1u && slot <= 8u) request_delete((uint8_t)(slot - 1u));
+    else gesture_usb_log(0, "ERROR,BAD_COMMAND\r\n");
+}
+
+static void engine_events(uint32_t now)
+{
+    ge_event_t event;
+    uint8_t similar_slot = GE_CLASS_NONE;
+    while (ge_next_event(&engine, &event)) {
+        switch (event.type) {
+        case GE_EVENT_MATCH:
+            if (!armed) break;
+            view.best_slot = event.class_id < GE_MAX_CLASSES ? (int8_t)event.class_id : -1;
+            view.best_score = event.distance;
+            view.second_score = event.second_distance;
+            if (view.best_slot >= 0 || view.state != DISPLAY_STATE_UNKNOWN ||
+                (int32_t)(transient_until - now) <= 0) {
+                view.state = view.best_slot >= 0 ? DISPLAY_STATE_MATCH : DISPLAY_STATE_ARMED;
+                transient_until = 0u;
+                message(view.best_slot >= 0 ? "Matching gesture" : "Tracking motion");
+            }
+            if (view.best_slot >= 0) show_match_rgb(event.class_id, now, 200u);
+            gesture_usb_log(0, "MATCH,%lu,%u,%lu,%lu,%lu\r\n", (unsigned long)now,
+                view.best_slot >= 0 ? (unsigned)event.class_id + 1u : 0u,
+                (unsigned long)(event.distance < 1000.0f ? event.distance * 1000000.0f : 999999999.0f),
+                (unsigned long)(event.second_distance < 1000.0f ? event.second_distance * 1000000.0f : 999999999.0f),
+                (unsigned long)event.duration_ms);
+            break;
+        case GE_EVENT_RECOGNIZED:
+            if (!armed) break;
+            ++recognized_count;
+            view.best_slot = (int8_t)event.class_id;
+            view.best_score = event.distance;
+            view.second_score = event.second_distance;
+            view.state = DISPLAY_STATE_MATCH;
+            transient_until = now + 1200u;
+            message("Gesture accepted");
+            show_match_rgb(event.class_id, now, 1200u);
+            gesture_usb_log(0, "EVENT,%lu,%u,%lu,%lu,%lu\r\n", (unsigned long)now,
+                (unsigned)event.class_id + 1u, (unsigned long)(event.distance * 1000000.0f),
+                (unsigned long)(event.second_distance < 1000.0f ? event.second_distance * 1000000.0f : 999999999.0f),
+                (unsigned long)event.duration_ms);
+            break;
+        case GE_EVENT_UNKNOWN:
+            if (!armed) break;
+            ++unknown_count;
+            view.best_slot = -1;
+            view.best_score = event.distance;
+            view.second_score = event.second_distance;
+            view.state = DISPLAY_STATE_UNKNOWN;
+            transient_until = now + 600u;
+            rgb_match_slot = GE_CLASS_NONE;
+            message(event.status == GE_OK ? "No confident match" : ge_status_string(event.status));
+            update_rgb(now);
+            gesture_usb_log(0, "UNKNOWN,%lu,%s\r\n", (unsigned long)now,
+                            event.status == GE_OK ? "NO_MATCH" : ge_status_string(event.status));
+            break;
+        case GE_EVENT_DEMO_ACCEPTED:
+            message(event.training_count < GE_TEMPLATES_PER_CLASS ? "Accepted. OK save or HOLD KEY add" : "3 demos accepted. OK to save");
+            gesture_usb_log(0, "TRAIN,DEMO,%u,%u\r\n", (unsigned)selected + 1u, event.training_count);
+            if (event.training_count > 1u && ge_training_ready(&engine)) {
+                view.state = DISPLAY_STATE_READY;
+                gesture_usb_log(0, "TRAIN,READY,%u,%u\r\n", (unsigned)selected + 1u, event.training_count);
+            }
+            break;
+        case GE_EVENT_DEMO_REJECTED:
+            view.state = ge_training_ready(&engine) ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
+            (void)snprintf(view.message, sizeof(view.message), "%s. HOLD KEY to retry", ge_status_string(event.status));
+            gesture_usb_log(0, "TRAIN,REJECT,%s\r\n", ge_status_string(event.status));
+            break;
+        case GE_EVENT_TRAIN_READY:
+            view.state = DISPLAY_STATE_READY;
+            message("Demo ready. OK save or HOLD KEY add");
+            gesture_usb_log(0, "TRAIN,READY,%u,%u\r\n", (unsigned)selected + 1u,
+                (unsigned)ge_training_progress(&engine));
+            break;
+        case GE_EVENT_DEMO_WARNING:
+            if (event.status != GE_ERR_CONFLICT || event.class_id >= GE_MAX_CLASSES) break;
+            similar_slot = event.class_id;
+            gesture_usb_log(0, "TRAIN,WARN,SIMILAR,%u,%lu,%lu\r\n", (unsigned)event.class_id + 1u,
+                (unsigned long)(event.distance * 1000000.0f),
+                (unsigned long)(event.second_distance * 1000000.0f));
+            break;
+        default: break;
+        }
+    }
+    /* The accepted and ready events belong to the same capture; retain its warning. */
+    if (similar_slot < GE_MAX_CLASSES) {
+        view.state = ge_training_ready(&engine) ? DISPLAY_STATE_READY : DISPLAY_STATE_LEARNING;
+        (void)snprintf(view.message, sizeof(view.message), "Similar to slot %u. OK still saves",
+            (unsigned)similar_slot + 1u);
+    }
+}
+
+static void sample_once(uint32_t ticks)
+{
+    BoardImuSample raw;
+    ge_sample_t sample;
+    uint32_t delta = ticks - processed_ticks, cycles, elapsed;
+    processed_ticks = ticks;
+    if (delta > 1u) {
+        sample_drops += delta - 1u;
+        if (capture_held) capture_interrupted = 1u;
+        ge_reset_stream(&engine);
+    }
+    cycles = DWT->CYCCNT;
+    if (!board_read_imu(&raw)) {
+        ++imu_errors;
+        if (consecutive_errors < 255u) ++consecutive_errors;
+        if (capture_held) capture_interrupted = 1u;
+        ge_reset_stream(&engine);
+        if (consecutive_errors == 3u) {
+            cancel();
+            calibrated = 0u;
+            view.state = DISPLAY_STATE_ERROR;
+            message("IMU read failed. Check board connection");
+            gesture_usb_log(0, "ERROR,IMU_READ\r\n");
+        }
+        return;
+    }
+    elapsed = DWT->CYCCNT - cycles;
+    if (elapsed > max_read_cycles) max_read_cycles = elapsed;
+    consecutive_errors = 0u;
+    ++samples;
+    sample.timestamp_ms = raw.timestamp_ms;
+    sample.ax = raw.accel[0]; sample.ay = raw.accel[1]; sample.az = raw.accel[2];
+    sample.gx = raw.gyro[0]; sample.gy = raw.gyro[1]; sample.gz = raw.gyro[2];
+    cycles = DWT->CYCCNT;
+    ge_feed(&engine, &sample);
+    elapsed = DWT->CYCCNT - cycles;
+    if (elapsed > max_feed_cycles) max_feed_cycles = elapsed;
+    engine_events(raw.timestamp_ms);
+    if (stream_raw) gesture_usb_log(1, "RAW,%lu,%lu,%ld,%ld,%ld,%ld,%ld,%ld,%u\r\n",
+        (unsigned long)samples, (unsigned long)raw.timestamp_ms,
+        (long)(sample.ax * 1000.0f), (long)(sample.ay * 1000.0f), (long)(sample.az * 1000.0f),
+        (long)(sample.gx * 1000.0f), (long)(sample.gy * 1000.0f), (long)(sample.gz * 1000.0f),
+        (unsigned)(board_user_key_down() != 0u));
+}
+
+static void update_rgb(uint32_t now)
+{
+    static const uint32_t slot_colors[GE_MAX_CLASSES] = {
+        0x180000u, 0x001800u, 0x000018u, 0x181800u,
+        0x001818u, 0x180018u, 0x180800u, 0x181818u
+    };
+    uint32_t color;
+    if (view.state == DISPLAY_STATE_ERROR) color = (now / 150u) % 2u ? 0u : 0x180000u;
+    else if (training) {
+        if (capture_held) color = slot_colors[selected];
+        else color = ge_training_ready(&engine) ? 0x180c00u : 0x000004u;
+    } else if (armed && rgb_match_slot < GE_MAX_CLASSES && (int32_t)(rgb_match_until - now) > 0)
+        color = slot_colors[rgb_match_slot];
+    else if (view.state == DISPLAY_STATE_UNKNOWN) {
+        uint32_t elapsed = now - (transient_until - 600u);
+        color = (elapsed < 150u || (elapsed >= 300u && elapsed < 450u)) ? 0x180000u : 0u;
+    }
+    else if (armed) color = 0x001010u;
+    else color = 0x020202u;
+    if (color != last_rgb) {
+        board_rgb((uint8_t)(color >> 16), (uint8_t)(color >> 8), (uint8_t)color);
+        last_rgb = color;
+    }
+}
+
+void gesture_app_init(void)
+{
+    uint32_t length = 0u;
+    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
+    DWT->CYCCNT = 0u;
+    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
+    ge_init(&engine);
+    ge_set_manual_training(&engine, 1);
+    ge_set_streaming_recognition(&engine, 1);
+    ge_set_recognition(&engine, 0);
+    gesture_usb_init(command);
+    memset(&view, 0, sizeof(view));
+    view.best_slot = -1;
+    (void)display_init();
+    message("Starting sensors and storage");
+    startup_paint(100u);
+    ready_mask = board_init();
+    user_was_down = board_user_key_down();
+    if ((ready_mask & BOARD_READY_FLASH) && board_store_load(model_blob, sizeof(model_blob), &length)) {
+        if (ge_model_import(&engine, model_blob, length) != GE_OK) message("Stored model invalid; empty model");
+    }
+    calibrated = 0u;
+    if (ready_mask & BOARD_READY_IMU) {
+        reset_stream();
+        message("Ready. Calibration optional");
+        if (HAL_TIM_Base_Start_IT(&htim7) != HAL_OK) {
+            ready_mask &= ~BOARD_READY_IMU;
+            view.state = DISPLAY_STATE_ERROR;
+            message("Sample timer failed");
+            gesture_usb_log(0, "ERROR,STARTUP,TIMER_FAILED\r\n");
+        }
+    } else {
+        view.state = DISPLAY_STATE_ERROR;
+        message("BMI088 not found. Check hardware");
+        gesture_usb_log(0, "ERROR,STARTUP,IMU_UNAVAILABLE\r\n");
+    }
+    update_view();
+    report_firmware();
+}
+
+void gesture_app_tick_isr(void) { ++sample_ticks; }
+
+void gesture_app_process(void)
+{
+    uint32_t now;
+    uint32_t ticks = sample_ticks;
+    if (ticks != processed_ticks && (ready_mask & BOARD_READY_IMU)) sample_once(ticks);
+    now = HAL_GetTick();
+    if ((uint32_t)(now - last_key_ms) >= 5u) {
+        BoardKey key;
+        last_key_ms = now;
+        key = board_poll_key(now);
+        user_key_process(now);
+        key_event(key);
+    }
+    gesture_usb_process();
+    if (transient_until && (int32_t)(HAL_GetTick() - transient_until) >= 0) {
+        transient_until = 0u;
+        view.state = armed ? DISPLAY_STATE_ARMED : DISPLAY_STATE_IDLE;
+        message(armed ? "Recognition enabled" : "Ready");
+    }
+    if ((uint32_t)(now - last_view_ms) >= 100u) {
+        last_view_ms = now;
+        update_view();
+    }
+    update_rgb(now);
+    if ((uint32_t)(now - last_status_ms) >= 1000u) {
+        last_status_ms = now;
+        report_status();
+    }
+    display_process();
+}

@@ -1,0 +1,11 @@
+MDK-ARM/Build/
+MDK-ARM/DM_MC02_Gesture/
+MDK-ARM/*.uvguix.*
+MDK-ARM/*.lst
+MDK-ARM/*.log
+__pycache__/
+*.pyc
+GUI/.venv/
+GUI/data/
+GUI/dev-tools/node_modules/
+GUI/dev-tools/screenshots/

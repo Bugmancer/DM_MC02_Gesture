@@ -1,0 +1,100 @@
+"""Exercise the local HTTP boundary without physical hardware."""
+import http.client
+import json
+from pathlib import Path
+import tempfile
+import threading
+import time
+import unittest
+
+from backend import Controller
+from server import create_server
+
+
+class ServerTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.controller = Controller(data_dir=self.temp.name, ports_provider=lambda: [])
+        self.server = create_server(self.controller, port=0, data_dir=self.temp.name)
+        self.worker = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.worker.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.worker.join()
+        self.controller.close()
+        self.server.server_close()
+        self.temp.cleanup()
+
+    def request(self, path, payload=None, headers=None):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=4)
+        actual = {"X-Gesture-Token": self.server.token, "Content-Type": "application/json"}
+        actual.update(headers or {})
+        connection.request("GET" if payload is None else "POST", path,
+                           None if payload is None else json.dumps(payload), actual)
+        response = connection.getresponse()
+        body = response.read()
+        result = response.status, body, dict(response.getheaders())
+        connection.close()
+        return result
+
+    def test_static_assets_and_session(self):
+        for path in ("/", "/app.js", "/air-pen.js", "/styles.css", "/board.png", "/vendor/chart.umd.js", "/vendor/lucide.min.js"):
+            status, body, headers = self.request(path)
+            self.assertEqual(status, 200, path)
+            self.assertGreater(len(body), 100)
+            self.assertEqual(headers["X-Content-Type-Options"], "nosniff")
+        status, body, _ = self.request("/api/session.json")
+        self.assertEqual(json.loads(body)["token"], self.server.token)
+
+    def test_mutations_require_local_host_origin_and_token(self):
+        for headers in ({"Host": "external.example"}, {"Origin": "https://external.example"}, {"X-Gesture-Token": "wrong"}):
+            self.assertEqual(self.request("/api/connect", {"demo": True}, headers)[0], 403)
+        self.assertEqual(self.controller.snapshot()["connection"]["state"], "disconnected")
+
+    def test_paths_and_invalid_requests(self):
+        for path in ("/../server.py", "/%2e%2e/server.py", "/api/missing"):
+            self.assertEqual(self.request(path)[0], 404)
+        self.assertEqual(self.request("/api/download?file=../settings.json")[0], 400)
+        self.assertEqual(self.request("/api/download?file=missing.csv")[0], 404)
+        self.assertEqual(self.request("/api/state?after=oops")[0], 400)
+        self.assertEqual(self.request("/api/command", ["arm"])[0], 400)
+        self.assertEqual(self.request("/api/command", {"command": "bad"})[0], 400)
+
+    def test_demo_capture_download_and_hotkey_rejection(self):
+        self.assertEqual(self.request("/api/connect", {"demo": True})[0], 200)
+        deadline = time.monotonic() + 3
+        while self.controller.snapshot()["connection"]["state"] != "connected" and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(self.controller.snapshot()["protocol"]["inventory"])
+        self.assertEqual(self.request("/api/settings", {"hotkeys_enabled": True})[0], 400)
+        metadata = {"user": "u01", "session": "test", "label": "unknown", "speed": "normal"}
+        self.assertEqual(self.request("/api/capture/start", metadata)[0], 200)
+        deadline = time.monotonic() + 2
+        while self.controller.snapshot()["capture"]["raw_count"] < 8 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(self.request("/api/capture/stop", {})[0], 200)
+        captures = json.loads(self.request("/api/captures")[1])["captures"]
+        self.assertEqual(len(captures), 1)
+        self.assertTrue(captures[0]["simulation"])
+        for name in captures[0]["files"].values():
+            status, body, headers = self.request("/api/download?file=" + name)
+            self.assertEqual(status, 200)
+            if not name.endswith(".events.jsonl"):
+                self.assertTrue(body)
+            self.assertIn("attachment", headers["Content-Disposition"])
+        self.assertEqual(self.request("/api/disconnect", {})[0], 200)
+
+    def test_pose_endpoint_and_local_assets(self):
+        self.request("/api/connect", {"demo": True})
+        deadline = time.monotonic() + 2
+        while not self.controller.snapshot()["pose"]["available"] and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(self.controller.snapshot()["pose"]["available"])
+        self.assertEqual(self.request("/api/pose/reset", {})[0], 200)
+        for path in ("/spatial.js", "/vendor/three.module.js", "/vendor/three.core.js", "/vendor/OrbitControls.js"):
+            self.assertEqual(self.request(path)[0], 200, path)
+
+
+if __name__ == "__main__":
+    unittest.main()
