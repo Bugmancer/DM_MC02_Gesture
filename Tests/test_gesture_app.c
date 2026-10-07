@@ -94,9 +94,9 @@ static void reset_app(void)
     timer_running = 0; timer_start_result = HAL_OK; reset_runtime();
     assert(armed && engine.recognizing && timer_running && !calibrated);
     assert(calibration_calls == 0U && config.class_limit == 8U && config.demo_target == 1U);
-    assert(strstr(log_history, "gesture-20261006-r9"));
+    assert(strstr(log_history, "gesture-20261007-r10"));
     assert(strstr(log_history, "RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG"));
-    assert(config.rgb_hold_ms == 3000U && strstr(log_history, "RGB_TIMING"));
+    assert(config.rgb_hold_ms == 3000U && strstr(log_history, "RGB_TIMING,MORE_DEMOS"));
     assert(max_log_length < 192U); clear_logs();
 }
 static void fixture_class(uint8_t slot)
@@ -110,7 +110,8 @@ static void pending_fixture(void)
 {
     unsigned i; assert(training && engine.training);
     engine.training_count = config.demo_target; engine.pending_ready = 1U; engine.pending_threshold = 0.1f;
-    for (i = 0U; i < config.demo_target; ++i) engine.pending[i].duration_ms = 700U;
+    engine.pending_count = config.demo_target < GE_TEMPLATES_PER_CLASS ? config.demo_target : GE_TEMPLATES_PER_CLASS;
+    for (i = 0U; i < engine.pending_count; ++i) engine.pending[i].duration_ms = 700U;
 }
 static void rgb_event(ge_event_type_t type, uint8_t slot, uint32_t now)
 {
@@ -176,6 +177,41 @@ static void test_configured_three_demos_and_target_gate(void)
     }
     assert(!training && armed && store_calls == 1U && ge_class_get(&engine, 0U)->template_count == 3U);
     reset_runtime(); assert(armed && config.demo_target == 3U && ge_class_count(&engine) == 1U);
+}
+static void test_twenty_demonstrations_select_templates_and_save_at_target(void)
+{
+    unsigned demo;
+    reset_app();
+    command("configure 8 20 180000 001800 000018 181800 001818 180018 180800 181818 3000");
+    assert(config.demo_target == 20U && store_calls == 1U);
+    command("learn 1");
+    for (demo = 1U; demo <= GE_MAX_TRAINING_DEMOS; ++demo) {
+        demonstrate(700U + 25U * (demo % 5U));
+        update_view();
+        if (demo < GE_MAX_TRAINING_DEMOS) {
+            assert(training && !armed && ge_training_progress(&engine) == demo);
+            assert(engine.pending_count <= GE_TEMPLATES_PER_CLASS && store_calls == 1U);
+            assert(view.learning_count == demo && view.learning_target == 20U);
+            if (demo == 3U || demo == 19U) {
+                command("save");
+                assert(training && store_calls == 1U && strstr(last_log, "NOT_READY"));
+            }
+        }
+    }
+    assert(!training && armed && store_calls == 2U);
+    assert(ge_class_get(&engine, 0U)->template_count == GE_TEMPLATES_PER_CLASS);
+    assert(strstr(log_history, "TRAIN,DEMO,1,20\r\n") && strstr(log_history, "SAVED,1,"));
+    reset_runtime();
+    assert(armed && config.demo_target == 20U && ge_class_get(&engine, 0U)->template_count == 3U);
+    command("learn 2"); pending_fixture(); store_success = 0; command("save");
+    assert(training && ge_training_progress(&engine) == 20U && engine.pending_count == 3U);
+    store_success = 1; command("save");
+    assert(!training && armed && ge_class_get(&engine, 1U)->template_count == 3U);
+    key_event(BOARD_KEY_UP); settings_select(1U); key_event(BOARD_KEY_RIGHT);
+    assert(config_draft.demo_target == 20U);
+    command("cancel");
+    command("configure 8 21 180000 001800 000018 181800 001818 180018 180800 181818 3000");
+    assert(config.demo_target == 20U && strstr(last_log, "CONFIG_RESULT,FAILED"));
 }
 static void test_save_failure_preserves_demonstrations_for_retry(void)
 {
@@ -358,6 +394,7 @@ static void test_inventory_settings_and_log_bounds(void)
     memcpy(engine.model.classes[7U].name, "Last,\r\n\xff", 8U); engine.model.classes[7U].name[8U] = '\0'; command("list");
     assert(strstr(log_history, "SLOT,8,3,Last____\r\n") && strstr(log_history, "CONFIG,8,1\r\n"));
     assert(strstr(log_history, "TIMING,3000\r\n"));
+    assert(strstr(log_history, "DEMOLIMIT,20\r\n"));
     for (slot = 0U; slot < 8U; ++slot) {
         (void)snprintf(line, sizeof(line), "COLOR,%u,%06lX\r\n", slot + 1U, (unsigned long)config.colors[slot]);
         assert(strstr(log_history, line));
@@ -428,6 +465,7 @@ int main(void)
     test_autonomous_start_cancel_and_gate();
     test_one_demo_automatically_saves_and_recognizes();
     test_configured_three_demos_and_target_gate();
+    test_twenty_demonstrations_select_templates_and_save_at_target();
     test_save_failure_preserves_demonstrations_for_retry();
     test_delete_cancel_failure_retry_and_resume();
     test_settings_edit_save_reboot_and_hidden_slots();
@@ -444,6 +482,6 @@ int main(void)
     test_key_timestamp_and_raw_physical_key();
     test_similar_demonstrations_do_not_block_auto_save();
     test_gui_config_is_atomic_and_preserves_templates();
-    puts("Gesture app tests passed (19 autonomous-device scenarios, real engine/config with mocked hardware).");
+    puts("Gesture app tests passed (20 autonomous-device scenarios, real engine/config with mocked hardware).");
     return 0;
 }

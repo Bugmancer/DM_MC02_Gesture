@@ -9,7 +9,7 @@ settings and templates share the board store's existing transaction boundary.
 | Field | Range | Default |
 | --- | --- | --- |
 | `class_limit` | 1 through 8 | 8 |
-| `demo_target` | 1 through 3 | 1 |
+| `demo_target` | 1 through 20 | 1 |
 | `rgb_hold_ms` | 100 through 30000 in 100 ms steps | 3000 |
 | `colors[8]` | `0x000000` through `0xFFFFFF` | Existing eight board colors |
 
@@ -24,27 +24,35 @@ ignore hidden classes; new learning cannot target a hidden slot. Existing
 classes are never overwritten by enrollment.
 
 `demo_target` is the application's confirmation requirement. It does not change
-the engine's storage capacity of three templates per class or rewrite existing
-models. The application enforces the configured target before confirmation.
+the engine's storage capacity of three representative templates per class or
+rewrite existing models. Each accepted demonstration participates in online
+representative selection. The application enforces the configured target before
+confirmation; `training_count` counts accepted demonstrations and `pending_count`
+counts representatives. Failed saves preserve both for retry.
 
 ## API
 
-Firmware r9 accepts a complete USB configuration command:
+Firmware r10 accepts a complete USB configuration command:
 
 ```text
-configure 2 3 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 5000
+configure 2 20 123456 abcdef 000000 00ff00 ff0000 0000ff ffffff 010203 5000
 ```
 
 The arguments are the class limit, demonstration target and exactly eight
 six-digit RGB colors and the RGB hold time in milliseconds. Omitting the hold
 time preserves the current value, so r8 GUI commands remain valid. The longest
-command is 76 bytes including LF and fits the 80-byte USB input buffer. Changes
+command is 77 bytes including LF and fits the 80-byte USB input buffer. Changes
 are rejected during learning, deletion confirmation or on-board settings.
 One flash transaction saves the complete settings and model; success emits
 `CONFIG` / `COLOR` / `TIMING` records followed by `CONFIG_RESULT,SAVED`. Failure emits
 `CONFIG_RESULT,FAILED` and restores the previous settings. Recognition resumes
 when the sensor and sampling timer remain ready. The GUI waits for this result
 and does not apply its local draft optimistically.
+
+`MORE_DEMOS` and `DEMOLIMIT,20` advertise the new demonstration limit. Hosts keep
+the previous limit of 3 with older firmware. The configuration envelope and
+embedded `GDT1` model sizes remain unchanged; old settings and templates import
+as before. Older firmware is not guaranteed to accept a setting above 3.
 
 ```c
 gesture_config_t config;

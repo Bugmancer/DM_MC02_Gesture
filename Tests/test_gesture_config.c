@@ -68,7 +68,7 @@ static void test_defaults_and_limits(void)
     assert(config.colors[0] == 0x180000u && config.colors[7] == 0x181818u);
     assert(gc_validate(NULL) == GE_ERR_ARGUMENT);
     for (limit = 1u; limit <= GE_MAX_CLASSES; ++limit)
-        for (demos = 1u; demos <= GE_TEMPLATES_PER_CLASS; ++demos) {
+        for (demos = 1u; demos <= GE_MAX_TRAINING_DEMOS; ++demos) {
             config.class_limit = (uint8_t)limit;
             config.demo_target = (uint8_t)demos;
             assert(gc_validate(&config) == GE_OK);
@@ -80,7 +80,7 @@ static void test_defaults_and_limits(void)
     gc_defaults(&config);
     config.demo_target = 0u;
     assert(gc_validate(&config) == GE_ERR_ARGUMENT);
-    config.demo_target = 4u;
+    config.demo_target = GE_MAX_TRAINING_DEMOS + 1u;
     assert(gc_validate(&config) == GE_ERR_ARGUMENT);
     for (id = 0u; id < GE_MAX_CLASSES; ++id) {
         gc_defaults(&config);
@@ -111,7 +111,7 @@ static void test_roundtrip_preserves_hidden_models(void)
     fixture_class(&source, 7u, "EIGHTH");
     legacy_length = ge_model_export(&source, legacy, sizeof(legacy));
     assert(legacy_length > 0u);
-    for (demos = 1u; demos <= GE_TEMPLATES_PER_CLASS; ++demos) {
+    for (demos = 1u; demos <= GE_MAX_TRAINING_DEMOS; ++demos) {
         for (limit = 1u; limit <= GE_MAX_CLASSES; ++limit) {
             gc_defaults(&config);
             config.class_limit = (uint8_t)limit;
@@ -211,7 +211,7 @@ static void test_corruption_and_invalid_settings_are_atomic(void)
     size_t length;
     unsigned i;
     static const unsigned offsets[] = {16u, 17u, 18u, 23u};
-    static const uint8_t values[] = {0u, 4u, 1u, 1u};
+    static const uint8_t values[] = {0u, GE_MAX_TRAINING_DEMOS + 1u, 1u, 1u};
     gc_defaults(&config);
     config.class_limit = 3u;
     config.demo_target = 2u;

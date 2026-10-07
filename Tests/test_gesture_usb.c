@@ -205,17 +205,17 @@ static void test_line_parser_rejects_overflow_and_control_bytes(void)
 static void test_rgb_timing_configuration_crosses_usb_packet_boundary(void)
 {
     static const uint8_t line[] =
-        "configure 8 3 ffffff ffffff ffffff ffffff ffffff ffffff ffffff ffffff 30000\n";
+        "configure 8 20 ffffff ffffff ffffff ffffff ffffff ffffff ffffff ffffff 30000\n";
     reset_usb();
     connect_ready();
-    assert(sizeof(line) - 1U == 76U);
+    assert(sizeof(line) - 1U == 77U);
     gesture_usb_receive(line, 64U);
     gesture_usb_process();
     assert(command_count == 0U);
     gesture_usb_receive(line + 64U, sizeof(line) - 1U - 64U);
     gesture_usb_process();
-    assert(command_count == 1U && strlen(received_command) == 75U);
-    assert(!memcmp(received_command, line, 75U));
+    assert(command_count == 1U && strlen(received_command) == 76U);
+    assert(!memcmp(received_command, line, 76U));
 }
 
 int main(void)

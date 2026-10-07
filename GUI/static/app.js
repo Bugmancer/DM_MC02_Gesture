@@ -297,6 +297,14 @@ function renderBoardConfig() {
   holdInput.title = hasCapability("RGB_TIMING") ? "确认识别后 RGB 灯色保持时长" : "修改灯色持续时间需要 r9 固件";
   $("#config-timing-status").hidden = !writable || hasCapability("RGB_TIMING");
   $("#config-class-limit").value = draft.class_limit;
+  const demoLimit = hasCapability("MORE_DEMOS") ? ui.state?.config?.demo_limit || 20 : 3;
+  for (const option of $("#config-demo-target").options) {
+    option.disabled = Number(option.value) > demoLimit;
+    option.hidden = Number(option.value) > demoLimit;
+  }
+  $("#config-demo-target").title = hasCapability("MORE_DEMOS")
+    ? `每个动作可录制 1～${demoLimit} 次示范，板端保留最多 3 个代表模板`
+    : "当前固件最多 3 次，升级 r10 可录制更多示范";
   $("#config-demo-target").value = draft.demo_target;
   $("#config-class-limit").disabled = $("#config-demo-target").disabled = !writable || busy;
   const validHold = Number.isInteger(holdMs) && holdMs >= 100 && holdMs <= 30000 && holdMs % 100 === 0;
@@ -597,7 +605,7 @@ function renderState() {
       .classList.toggle("good", slot.state === "saved");
     stateElement.querySelector(".slot-state-text").textContent =
       slot.state === "saved"
-        ? `${slot.templates || 1} 段 · 已保存`
+        ? `${slot.templates || 1} 个代表模板 · 已保存`
         : slot.state === "empty"
           ? "空槽位"
           : "未同步";
@@ -675,7 +683,7 @@ function renderTraining() {
     : Number(training.required) || 3;
   const capturing = selectedActive && Boolean(training.capturing);
   const count = selectedActive
-    ? Math.min(3, Number(training.collected) || 0)
+    ? Math.min(target, Number(training.collected) || 0)
     : slot.state === "saved"
       ? slot.templates || 3
       : 0;
@@ -701,7 +709,9 @@ function renderTraining() {
                 ? "槽位状态未同步"
                 : "等待准备学习";
   $("#training-count").textContent = String(count);
-  $("#training-count-label").textContent = oneDemo
+  $("#training-count-label").textContent = !selectedActive && slot.state === "saved"
+    ? " 个代表模板 · 已保存"
+    : oneDemo
     ? " 段示范 · 最多 3 段"
     : ` / ${target} 次示范`;
   $("#training-template-count").textContent =
@@ -713,8 +723,9 @@ function renderTraining() {
       : hasCapability("NO_CALIBRATION")
         ? "未校准（可选）"
         : "未校准（旧固件）";
+  $(".sample-progress").hidden = target > 3;
   $$(".sample-step").forEach((element, index) => {
-    element.hidden = !oneDemo && index >= target;
+    element.hidden = target > 3 || (!oneDemo && index >= target);
     element.querySelector("small").textContent = oneDemo
       ? ["示范", "补充（可选）", "补充（可选）"][index]
       : ["示范一", "示范二", "示范三"][index];
@@ -724,6 +735,14 @@ function renderTraining() {
       selectedActive && (!ready || oneDemo) && index === count,
     );
   });
+  const progress = $("#training-progress-bar");
+  progress.hidden = target <= 3;
+  const progressCount = selectedActive ? count : slot.state === "saved" ? target : 0;
+  progress.setAttribute("aria-valuemax", String(target));
+  progress.setAttribute("aria-valuenow", String(progressCount));
+  progress.setAttribute("aria-valuetext", slot.state === "saved" && !selectedActive
+    ? `已保存 ${slot.templates || 0} 个代表模板` : `已录入 ${progressCount} / ${target} 次示范`);
+  progress.querySelector("span").style.width = `${100 * progressCount / target}%`;
   $("#training-message").textContent = !connected
     ? "未开始录制"
     : !manualTraining
@@ -740,7 +759,7 @@ function renderTraining() {
                   : "示范已完成，可以保存"
               : `第 ${count + 1} 次示范尚未开始`)
         : slot.state === "saved"
-          ? "动作已可用于识别"
+          ? "动作已可用于识别，板端保留代表模板"
           : slot.state === "unknown"
             ? "等待固件返回槽位状态"
             : "未开始录制";

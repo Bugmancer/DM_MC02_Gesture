@@ -205,6 +205,10 @@
               </select></label>
               <label>示范次数<select id="config-demo-target" aria-label="每个动作的示范次数">
                 <option>1</option><option>2</option><option selected>3</option>
+                <option>4</option><option>5</option><option>6</option><option>7</option>
+                <option>8</option><option>9</option><option>10</option><option>11</option>
+                <option>12</option><option>13</option><option>14</option><option>15</option>
+                <option>16</option><option>17</option><option>18</option><option>19</option><option>20</option>
               </select></label>
               <label>灯色持续时间<input id="config-rgb-hold" type="number" min="0.1" max="30" step="0.1" value="3" required aria-label="灯色持续时间" disabled><span>秒</span></label>
               <button id="config-save" class="button secondary" disabled><i data-lucide="save"></i>保存到板子</button>
@@ -218,7 +222,7 @@
                     <th class="slot-number">槽位</th>
                     <th>动作名称</th>
                     <th>RGB 灯色</th>
-                    <th>示范 / 状态</th>
+                    <th>模板 / 状态</th>
                     <th>电脑快捷键</th>
                     <th class="actions-heading">操作</th>
                   </tr>
@@ -247,6 +251,7 @@
                 <span>3</span><small>示范三</small>
               </div>
             </div>
+            <div id="training-progress-bar" class="training-progress-bar" role="progressbar" aria-label="示范录制进度" aria-valuemin="0" aria-valuemax="3" aria-valuenow="0" hidden><span></span></div>
             <div class="training-count">
               <span id="training-count">0</span
               ><span id="training-count-label"> / 3 次示范</span>
@@ -292,7 +297,7 @@
             <div class="training-detail">
               <div><span>模板保存位置</span><strong>板载 Flash</strong></div>
               <div>
-                <span>当前动作模板</span
+                <span>板端代表模板</span
                 ><strong id="training-template-count">未同步</strong>
               </div>
               <div>

@@ -193,7 +193,7 @@ static void test_device_settings_and_active_slots_fit_panel(void)
     unsigned int row, selection;
     reset_refresh();
     current_view.class_limit = 3U;
-    current_view.config_demos = 2U;
+    current_view.config_demos = 20U;
     current_view.config_rgb_hold_ms = 30000U;
     current_view.config_slot = 2U;
     current_view.slot_colors[2] = 0x12abffUL;
@@ -213,6 +213,7 @@ static void test_device_settings_and_active_slots_fit_panel(void)
         assert(strstr(wanted[12].text, "12ABFF") != NULL);
         assert(strstr(wanted[2].text, "save failed") != NULL);
         assert(strstr(wanted[5].text, "30.0 s") != NULL);
+        assert(strstr(wanted[4].text, "20 / 20") != NULL);
         assert(strstr(wanted[7].text, "18") != NULL);
         assert(strstr(wanted[8].text, "171") != NULL);
         assert(strstr(wanted[9].text, "255") != NULL);

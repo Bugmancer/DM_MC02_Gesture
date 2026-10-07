@@ -94,8 +94,10 @@ class ProtocolTests(unittest.TestCase):
 
     def test_board_config_and_actual_rgb(self):
         self.assertEqual(host.parse_line("CONFIG,4,2"), {"kind": "CONFIG", "class_limit": 4, "demo_target": 2})
+        self.assertEqual(host.parse_line("CONFIG,8,20"), {"kind": "CONFIG", "class_limit": 8, "demo_target": 20})
+        self.assertEqual(host.parse_line("DEMOLIMIT,20"), {"kind": "DEMOLIMIT", "demo_limit": 20})
         self.assertEqual(host.parse_line("COLOR,8,18A000"), {"kind": "COLOR", "id": 8, "color": "#18a000"})
-        for line in ("CONFIG,0,1", "CONFIG,9,1", "CONFIG,8,0", "CONFIG,8,4", "CONFIG,8", "COLOR,0,000000", "COLOR,1,FFF", "COLOR,1,GGGGGG"):
+        for line in ("CONFIG,0,1", "CONFIG,9,1", "CONFIG,8,0", "CONFIG,8,21", "CONFIG,8", "DEMOLIMIT,0", "DEMOLIMIT,21", "DEMOLIMIT,20,3", "COLOR,0,000000", "COLOR,1,FFF", "COLOR,1,GGGGGG"):
             with self.subTest(line=line), self.assertRaises(ValueError):
                 host.parse_line(line)
 

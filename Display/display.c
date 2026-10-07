@@ -104,7 +104,7 @@ static void compose_settings(void)
     (void)snprintf(wanted[2].text, sizeof(wanted[2].text), "%.*s", (int)TEXT_LENGTH, current_view.message);
     wanted[2].foreground = COLOR_YELLOW;
     (void)snprintf(wanted[3].text, sizeof(wanted[3].text), "  ACTION COUNT       %u / 8", (unsigned)current_view.class_limit);
-    (void)snprintf(wanted[4].text, sizeof(wanted[4].text), "  DEMOS PER ACTION   %u / 3", (unsigned)current_view.config_demos);
+    (void)snprintf(wanted[4].text, sizeof(wanted[4].text), "  DEMOS PER ACTION   %u / 20", (unsigned)current_view.config_demos);
     (void)snprintf(wanted[5].text, sizeof(wanted[5].text), "  RGB HOLD TIME      %u.%u s",
         (unsigned)current_view.config_rgb_hold_ms / 1000U,
         ((unsigned)current_view.config_rgb_hold_ms % 1000U) / 100U);

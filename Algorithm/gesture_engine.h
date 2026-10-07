@@ -10,6 +10,7 @@ extern "C" {
 
 #define GE_MAX_CLASSES 8u
 #define GE_TEMPLATES_PER_CLASS 3u
+#define GE_MAX_TRAINING_DEMOS 20u
 #define GE_POINTS 48u
 #define GE_FEATURES 6u
 #define GE_NAME_BYTES 16u
@@ -71,15 +72,17 @@ typedef struct {
 typedef struct {
     ge_model_t model;
     ge_template_t pending[GE_TEMPLATES_PER_CLASS];
+    uint8_t pending_support[GE_TEMPLATES_PER_CLASS];
     int16_t samples[GE_MAX_SAMPLES][GE_FEATURES];
     int16_t pre_roll[GE_PRE_ROLL_SAMPLES][GE_FEATURES];
     float dtw_rows[2][GE_POINTS + 3u];
     int16_t stream_samples[GE_STREAM_SAMPLES][GE_FEATURES];
     float stream_best, stream_second, stream_class_best;
     uint32_t stream_cycle_ms, stream_quiet_ms, stream_start_ms;
+    uint32_t stream_total, stream_endpoint, stream_accepted_end[GE_MAX_CLASSES];
     uint16_t stream_head, stream_count, stream_end, stream_available, stream_duration, stream_class_duration;
     uint8_t streaming, stream_cycle, stream_class, stream_scale, stream_id;
-    uint8_t stream_candidate, stream_verify, stream_latched;
+    uint8_t stream_candidate, stream_verify, stream_latched, stream_accepted_mask;
     uint16_t stream_active_ms, stream_strong_samples;
     float gravity[3];
     char pending_name[GE_NAME_BYTES];
@@ -87,7 +90,7 @@ typedef struct {
     uint32_t last_ms, settle_ms, start_ms, active_ms, quiet_ms, cooldown_ms, strong_ms;
     uint16_t sample_count, pre_count, pre_head, strong_samples;
     uint8_t initialized, recognizing, capturing, training;
-    uint8_t training_count, pending_ready, start_count, pending_class_id;
+    uint8_t training_count, pending_count, pending_ready, start_count, pending_class_id;
     uint8_t armed, manual_training, class_limit;
     float pending_threshold;
     ge_event_t events[4];
@@ -102,9 +105,10 @@ void ge_init(ge_engine_t *engine);
 void ge_reset_stream(ge_engine_t *engine);
 /* Only controls classification; segmentation and demonstration input continue. */
 void ge_set_recognition(ge_engine_t *engine, int enabled);
-/* Rolling DTW previews during movement, plus at most one actionable recognition
- * until 400 ms of quiet. Matching is spread over samples (at most three DTWs per
- * feed); automatic training and the stored template format are unchanged. */
+/* Rolling DTW searches complete gestures inside continuous movement, including
+ * different gestures without a quiet gap. Overlapping repeats of the same
+ * occurrence are suppressed. At most three DTWs run per feed; the stored
+ * three-template model format and legacy automatic training are unchanged. */
 void ge_set_streaming_recognition(ge_engine_t *engine, int enabled);
 /* Default is automatic. Changing this setting discards an in-flight segment;
  * manual input changes learning only, never recognition segmentation. */
@@ -115,8 +119,10 @@ ge_status_t ge_set_class_limit(ge_engine_t *engine, uint8_t limit);
 void ge_feed(ge_engine_t *engine, const ge_sample_t *sample);
 int ge_next_event(ge_engine_t *engine, ge_event_t *event);
 
-/* Begin a new class: manual input needs one demonstration, with up to three
- * optional refinements; automatic input needs three. Then explicit confirmation.
+/* Begin a new class: manual input needs one demonstration and permits up to
+ * GE_MAX_TRAINING_DEMOS refinements; automatic input needs three. All accepted
+ * manual demonstrations contribute to incremental selection of at most three
+ * representative templates. Then explicit confirmation.
  * Existing classes are never overwritten. Failed trials can be repeated.
  * Similarity to an existing class warns after accepting a manual demonstration;
  * automatic enrollment still rejects conflicts. Recognition ambiguity rejects.

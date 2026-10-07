@@ -117,7 +117,7 @@ class Controller:
                         "usb_drops": 0, "max_feed_us": 0, "max_read_us": 0}
         self._protocol = {"version": None, "inventory": False, "manual_training": False,
                           "firmware": None, "capabilities": [], "requires_calibration": False}
-        self._config = {"class_limit": 8, "demo_target": 3, "reported": False,
+        self._config = {"class_limit": 8, "demo_target": 3, "demo_limit": 3, "reported": False,
                         "rgb_hold_ms": 3000, "timing_reported": False}
         self._config_write = {"state": "idle", "message": ""}
         self._config_write_started = None
@@ -358,7 +358,7 @@ class Controller:
     def configure_board(self, payload):
         """Queue one transactional Flash update; only board ACK confirms success."""
         limit = _integer(payload.get("class_limit"), 1, 8)
-        demos = _integer(payload.get("demo_target"), 1, 3)
+        demos = _integer(payload.get("demo_target"), 1, 20)
         colors = payload.get("colors")
         if (not isinstance(colors, list) or len(colors) != 8 or
                 any(not isinstance(value, str) or not re.fullmatch(r"#[0-9a-fA-F]{6}", value)
@@ -375,6 +375,10 @@ class Controller:
                 raise ValueError("请先连接设备")
             if "GUI_CONFIG" not in self._protocol["capabilities"]:
                 raise ValueError("网页修改板端配置需要 r8 固件")
+            if demos > 3 and "MORE_DEMOS" not in self._protocol["capabilities"]:
+                raise ValueError("超过三次示范需要 r10 固件")
+            if demos > self._config["demo_limit"]:
+                raise ValueError(f"当前板端最多支持 {self._config['demo_limit']} 次示范")
             if "RGB_TIMING" in self._protocol["capabilities"]:
                 command += f" {hold_ms if hold_ms is not None else self._config['rgb_hold_ms']}"
             elif hold_ms is not None:
@@ -690,6 +694,7 @@ class Controller:
                 raise ValueError("Invalid firmware capability")
             changed = self._protocol["firmware"] != fields[0] or self._protocol["capabilities"] != fields[1:]
             self._protocol.update(firmware=fields[0], capabilities=fields[1:])
+            self._config["demo_limit"] = 20 if "MORE_DEMOS" in fields else 3
             self._training["required"] = (self._config["demo_target"] if self._config["reported"] else
                                            1 if "ONE_DEMO" in fields else 3)
             if "KEY_CAPTURE" in fields:
@@ -700,6 +705,8 @@ class Controller:
             self._config.update(class_limit=record["class_limit"], demo_target=record["demo_target"], reported=True)
             self._training["required"] = record["demo_target"]
             self._protocol["inventory"] = all(slot["state"] != "unknown" for slot in self._slots[:record["class_limit"]])
+        elif kind == "DEMOLIMIT":
+            self._config["demo_limit"] = record["demo_limit"]
         elif kind == "TIMING":
             self._config.update(rgb_hold_ms=record["rgb_hold_ms"], timing_reported=True)
         elif kind == "COLOR":
@@ -715,7 +722,7 @@ class Controller:
                 raise ValueError("INFO requires eight fields")
             version, ready_mask, display_ok, training, selected, progress, ready, deleting = map(_integer, fields)
             _integer(selected, 1, 8)
-            _integer(progress, 0, 3)
+            _integer(progress, 0, self._config["demo_limit"])
             if any(flag > 1 for flag in (display_ok, training, ready, deleting)):
                 raise ValueError("Invalid INFO flag")
             self._protocol.update(version=version, ready_mask=ready_mask,
@@ -777,9 +784,9 @@ class Controller:
                     self._recent_match = None
                     self._last_confident_match = None
                 elif mode == "DEMO":
-                    self._training.update(slot=slot, collected=_integer(fields[2], 0, 3), capturing=False, message="", warning=None)
+                    self._training.update(slot=slot, collected=_integer(fields[2], 0, self._config["demo_limit"]), capturing=False, message="", warning=None)
                 else:
-                    count = _integer(fields[2], 1, 3) if len(fields) == 3 else 3
+                    count = _integer(fields[2], 1, self._config["demo_limit"]) if len(fields) == 3 else self._training["required"]
                     self._training.update(state="ready", slot=slot, collected=count, capturing=False)
             elif mode == "REJECT":
                 self._training["message"] = ", ".join(fields[1:])
@@ -857,7 +864,8 @@ class Controller:
 
     def _demo_inventory(self):
         training = self._training
-        self._accept(parse_line("FIRMWARE,demo-gesture-20261006-r9,KEY_CAPTURE,NO_CALIBRATION,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG,RGB_TIMING"))
+        self._accept(parse_line("FIRMWARE,demo-gesture-20261007-r10,KEY_CAPTURE,NO_CALIBRATION,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG,RGB_TIMING,MORE_DEMOS"))
+        self._accept(parse_line("DEMOLIMIT,20"))
         self._accept(parse_line(f"CONFIG,{self._config['class_limit']},{self._config['demo_target']}"))
         self._accept(parse_line(f"TIMING,{self._config['rgb_hold_ms']}"))
         self._accept(parse_line(f"INFO,1,7,1,{int(training['state'] != 'idle')},"
@@ -902,7 +910,7 @@ class Controller:
                     self._accept(parse_line(f"TRAIN,DEMO,{slot},{count}"))
                     if count >= self._training["required"]:
                         self._accept(parse_line(f"TRAIN,READY,{slot},{count}"))
-                        self._demo_saved[slot] = count
+                        self._demo_saved[slot] = min(count, 3)
                         self._accept(parse_line(f"SAVED,{slot},1024"))
                         self._accept(parse_line("STATE,ARMED"))
                 if self._training["state"] != "idle" and self._training["collected"] < self._training["required"]:
@@ -933,7 +941,7 @@ class Controller:
                 self._accept(parse_line("STATE,ARMED"))
             elif self._training["state"] == "ready" and not self._training["capturing"]:
                 slot = self._training["slot"]
-                self._demo_saved[slot] = self._training["collected"]
+                self._demo_saved[slot] = min(self._training["collected"], 3)
                 self._accept(parse_line(f"SAVED,{slot},1024"))
                 self._accept(parse_line("STATE,ARMED"))
             else:

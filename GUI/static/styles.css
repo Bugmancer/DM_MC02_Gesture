@@ -957,6 +957,19 @@ h3 {
   background: #a57a33;
   border-color: #a57a33;
 }
+.training-progress-bar {
+  height: 8px;
+  margin: 28px 0 20px;
+  background: #e7eeeb;
+  border-radius: 4px;
+  overflow: hidden;
+}
+.training-progress-bar > span {
+  display: block;
+  height: 100%;
+  background: var(--teal);
+  transition: width .2s;
+}
 .sample-progress {
   display: flex;
   justify-content: space-between;

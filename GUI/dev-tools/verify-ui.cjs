@@ -144,12 +144,15 @@ async function verifyRgbTimingUI(fixture) {
     page.locator("#config-save").click()]);
   await page.waitForFunction(() => document.querySelector("#config-save").disabled);
   assert.equal(writes[0].rgb_hold_ms, 30000);
-  mock.protocol.capabilities = mock.protocol.capabilities.filter(cap => cap !== "RGB_TIMING");
+  mock.protocol.capabilities = mock.protocol.capabilities.filter(cap => !["RGB_TIMING", "MORE_DEMOS"].includes(cap));
   mock.protocol.firmware = "gesture-20261006-r8";
   mock.config.timing_reported = false;
   await page.waitForFunction(() => document.querySelector("#config-rgb-hold").disabled &&
     !document.querySelector("#config-timing-status").hidden);
   assert.equal(await page.locator("#config-class-limit").isEnabled(), true);
+  assert.equal(await page.locator('#config-demo-target').evaluate(element =>
+    [...element.options].find(option => option.value === "6").disabled), true,
+    "Legacy firmware must not offer unsupported demonstration counts");
   await page.locator("#config-class-limit").selectOption("4");
   await Promise.all([page.waitForResponse(response => response.url().endsWith("/api/board/config")),
     page.locator("#config-save").click()]);
@@ -158,6 +161,51 @@ async function verifyRgbTimingUI(fixture) {
     "r8 saves counts and colors using the original configuration protocol");
   await page.close();
   return {confirmedOnly: true, legacyConfiguration: true, savedHoldMs: writes[0].rgb_hold_ms};
+}
+
+async function verifyMoreDemosUI() {
+  const page = await browser.newPage({viewport: {width: 1440, height: 1000}});
+  await page.goto(url + "/#library");
+  await page.waitForFunction(() => !document.querySelector("#config-demo-target").disabled);
+  assert.equal(await page.locator('#config-demo-target').evaluate(element =>
+    [...element.options].find(option => option.value === "20").disabled), false);
+  await page.locator("#config-demo-target").selectOption("6");
+  await page.locator("#config-save").click();
+  await page.waitForFunction(() => document.querySelector("#config-save").disabled &&
+    document.querySelector("#config-save-status").textContent.includes("已保存"));
+  assert.equal((await api("/api/state")).config.demo_target, 6);
+  await page.locator('[data-slot="8"] .learn-slot').click();
+  await page.waitForFunction(() => !document.querySelector("#demo-key-button").disabled);
+  assert.equal(await page.locator(".sample-step:visible").count(), 0,
+    "Many demonstrations use a compact progress bar, not overflowing circles");
+  assert.equal(await page.locator("#training-progress-bar").getAttribute("aria-valuemax"), "6");
+  for (let count = 1; count <= 6; count++) {
+    const box = await page.locator("#demo-key-button").boundingBox();
+    await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+    await page.mouse.down();
+    await page.waitForFunction(() => document.querySelector("#training-status").textContent.includes("正在录制"));
+    await delay(300);
+    await page.mouse.up();
+    if (count < 6) {
+      await page.waitForFunction(value => Number(document.querySelector("#training-count").textContent) === value, count);
+      assert.equal(await page.locator("#training-progress-bar").getAttribute("aria-valuenow"), String(count));
+      const state = await api("/api/state");
+      assert.equal(state.slots[7].state, "empty", "No early save after three of six demonstrations");
+      assert.equal(state.status.armed, 0);
+      assert.equal(await page.locator("#save-button").isDisabled(), true);
+    }
+  }
+  await page.waitForFunction(() => document.querySelector('[data-slot="8"] .slot-state-text').textContent.includes("已保存"));
+  const saved = await api("/api/state");
+  assert.equal(saved.slots[7].templates, 3);
+  assert.equal(saved.status.armed, 1);
+  assert.equal(await page.locator("#training-count-label").textContent(), " 个代表模板 · 已保存");
+  await page.screenshot({path: path.join(screenshots, "desktop-more-demos.png"), fullPage: true});
+  await page.setViewportSize({width: 390, height: 844});
+  await noPageOverflow(page);
+  await page.screenshot({path: path.join(screenshots, "mobile-more-demos.png"), fullPage: true});
+  await page.close();
+  return {target: 6, representativeTemplates: 3, savedOnlyAtTarget: true};
 }
 
 async function verifyViewRecovery() {
@@ -425,7 +473,7 @@ function changedPixels(first, second) {
   );
   assert.ok(
     (await page.locator("#firmware-version").textContent()).includes(
-      "gesture-20261006-r9",
+      "gesture-20261007-r10",
     ),
   );
   assert.equal(await page.locator("#firmware-warning").isHidden(), true);
@@ -851,6 +899,7 @@ function changedPixels(first, second) {
   });
   await page.unroute("**/api/state*");
   const rgbTiming = await verifyRgbTimingUI(await api("/api/state"));
+  const moreDemos = await verifyMoreDemosUI();
   await page.locator("#connect-button").click();
   await page.waitForFunction(
     () => document.querySelector("#metric-armed").textContent === "等待连接",
@@ -867,6 +916,7 @@ function changedPixels(first, second) {
         mobileSpatialPixels,
         viewRecovery,
         rgbTiming,
+        moreDemos,
         screenshots,
         dataDir,
       },

@@ -40,6 +40,9 @@ static void reset_stream_match(ge_engine_t *e)
     e->stream_cycle = e->stream_verify = e->stream_latched = 0u;
     e->stream_candidate = e->stream_id = GE_CLASS_NONE;
     e->stream_quiet_ms = 0u;
+    e->stream_total = e->stream_endpoint = 0u;
+    e->stream_accepted_mask = 0u;
+    memset(e->stream_accepted_end, 0, sizeof(e->stream_accepted_end));
     e->stream_cycle_ms = e->last_ms;
     e->stream_active_ms = 0u;
     e->stream_strong_samples = 0u;
@@ -212,11 +215,13 @@ ge_status_t ge_train_begin_at(ge_engine_t *e, uint8_t id, const char *name)
     }
     if (n == 0u || n == GE_NAME_BYTES) return GE_ERR_ARGUMENT;
     memset(e->pending, 0, sizeof(e->pending));
+    memset(e->pending_support, 0, sizeof(e->pending_support));
     memset(e->pending_name, 0, sizeof(e->pending_name));
     memcpy(e->pending_name, name, n);
     e->training = 1u;
     e->pending_class_id = id;
     e->training_count = 0u;
+    e->pending_count = 0u;
     e->pending_ready = 0u;
     e->training_error = GE_OK;
     e->pending_threshold = 0.0f;
@@ -229,7 +234,7 @@ ge_status_t ge_train_begin_at(ge_engine_t *e, uint8_t id, const char *name)
 ge_status_t ge_train_capture_begin(ge_engine_t *e, uint32_t now)
 {
     if (!e) return GE_ERR_ARGUMENT;
-    if (!e->manual_training || !e->training || e->training_count >= GE_TEMPLATES_PER_CLASS) return GE_ERR_NOT_READY;
+    if (!e->manual_training || !e->training || e->training_count >= GE_MAX_TRAINING_DEMOS) return GE_ERR_NOT_READY;
     if (e->capturing) return GE_ERR_BUSY;
     if (now - e->last_ms > GE_MAX_GAP_MS) e->initialized = 0u;
     reset_capture(e, now);
@@ -242,10 +247,11 @@ ge_status_t ge_train_capture_begin(ge_engine_t *e, uint32_t now)
 void ge_train_cancel(ge_engine_t *e)
 {
     if (!e) return;
-    e->training = e->training_count = e->pending_ready = 0u;
+    e->training = e->training_count = e->pending_count = e->pending_ready = 0u;
     e->training_error = GE_OK;
     e->pending_threshold = 0.0f;
     memset(e->pending, 0, sizeof(e->pending));
+    memset(e->pending_support, 0, sizeof(e->pending_support));
     memset(e->pending_name, 0, sizeof(e->pending_name));
     e->event_count = e->event_read = e->event_write = 0u;
     reset_capture(e, e->last_ms);
@@ -263,7 +269,7 @@ ge_status_t ge_train_confirm(ge_engine_t *e, uint8_t *class_id)
     c = &e->model.classes[id];
     memset(c, 0, sizeof(*c));
     c->used = 1u;
-    c->template_count = e->training_count;
+    c->template_count = e->pending_count;
     c->threshold = e->pending_threshold;
     memcpy(c->name, e->pending_name, sizeof(c->name));
     memcpy(c->templates, e->pending, sizeof(c->templates));
@@ -333,12 +339,66 @@ static float class_distance(ge_engine_t *e, const ge_template_t *sample, const g
 static void reject_segment(ge_engine_t *e, ge_status_t status, uint32_t duration)
 {
     emit(e, GE_EVENT_SEGMENT_FINISHED, status, GE_CLASS_NONE, duration, 0.0f, 0.0f);
-    if (e->training && e->training_count < GE_TEMPLATES_PER_CLASS) {
+    if (e->training && e->training_count < GE_MAX_TRAINING_DEMOS) {
         e->training_error = status;
         emit(e, GE_EVENT_DEMO_REJECTED, status, GE_CLASS_NONE, duration, 0.0f, 0.0f);
     } else if (e->recognizing && !e->training) {
         emit(e, GE_EVENT_UNKNOWN, status, GE_CLASS_NONE, duration, 0.0f, 0.0f);
     }
+}
+
+/* Maintain bounded cluster representatives. The weighted medoid represents
+ * common demonstrations; farthest-first selection retains two variations.
+ * When one representative is omitted, its accumulated support goes to the
+ * nearest retained representative. No demonstration enlarges the model. */
+static void select_pending(ge_engine_t *e, const ge_template_t *sample)
+{
+    const ge_template_t *candidates[GE_TEMPLATES_PER_CLASS + 1u];
+    float distances[GE_TEMPLATES_PER_CLASS + 1u][GE_TEMPLATES_PER_CLASS + 1u];
+    uint8_t weights[GE_TEMPLATES_PER_CLASS + 1u], selected[GE_TEMPLATES_PER_CLASS + 1u];
+    uint8_t i, j, pick = 0u, omitted = 0u, nearest = 0u, stage;
+    float best = FLT_MAX;
+    if (e->pending_count < GE_TEMPLATES_PER_CLASS) {
+        e->pending[e->pending_count] = *sample;
+        e->pending_support[e->pending_count++] = 1u;
+        return;
+    }
+    memset(distances, 0, sizeof(distances));
+    memset(selected, 0, sizeof(selected));
+    for (i = 0u; i <= GE_TEMPLATES_PER_CLASS; ++i) {
+        candidates[i] = i == GE_TEMPLATES_PER_CLASS ? sample : &e->pending[i];
+        weights[i] = i == GE_TEMPLATES_PER_CLASS ? 1u : e->pending_support[i];
+        for (j = 0u; j < i; ++j)
+            distances[i][j] = distances[j][i] = distance_between(e, candidates[i], candidates[j]);
+    }
+    for (i = 0u; i <= GE_TEMPLATES_PER_CLASS; ++i) {
+        float cost = 0.0f;
+        for (j = 0u; j <= GE_TEMPLATES_PER_CLASS; ++j) cost += distances[i][j] * weights[j];
+        if (cost < best) { best = cost; pick = i; }
+    }
+    selected[pick] = 1u;
+    for (stage = 1u; stage < GE_TEMPLATES_PER_CLASS; ++stage) {
+        best = -1.0f;
+        for (i = 0u; i <= GE_TEMPLATES_PER_CLASS; ++i) {
+            float separation = FLT_MAX;
+            if (selected[i]) continue;
+            for (j = 0u; j <= GE_TEMPLATES_PER_CLASS; ++j)
+                if (selected[j]) separation = ge_min(separation, distances[i][j]);
+            if (separation > best) { best = separation; pick = i; }
+        }
+        selected[pick] = 1u;
+    }
+    for (i = 0u; i <= GE_TEMPLATES_PER_CLASS; ++i) if (!selected[i]) omitted = i;
+    best = FLT_MAX;
+    for (i = 0u; i <= GE_TEMPLATES_PER_CLASS; ++i) {
+        if (selected[i] && distances[omitted][i] < best) { best = distances[omitted][i]; nearest = i; }
+    }
+    weights[nearest] = (uint8_t)(weights[nearest] + weights[omitted]);
+    if (omitted < GE_TEMPLATES_PER_CLASS) {
+        e->pending[omitted] = *sample;
+        weights[omitted] = weights[GE_TEMPLATES_PER_CLASS];
+    }
+    for (i = 0u; i < GE_TEMPLATES_PER_CLASS; ++i) e->pending_support[i] = weights[i];
 }
 
 static void learn_segment(ge_engine_t *e, const ge_template_t *sample)
@@ -348,7 +408,7 @@ static void learn_segment(ge_engine_t *e, const ge_template_t *sample)
     float conflict_distance = FLT_MAX, conflict_limit = 0.0f;
     float demo_limit = e->manual_training ? GE_MANUAL_DEMO_MAX_DISTANCE : GE_DEMO_MAX_DISTANCE;
     ge_status_t status = GE_OK;
-    for (i = 0u; i < e->training_count; ++i) {
+    for (i = 0u; i < e->pending_count; ++i) {
         float d = distance_between(e, sample, &e->pending[i]);
         worst = ge_max(worst, d);
         if (d > demo_limit) status = GE_ERR_INCONSISTENT;
@@ -364,6 +424,9 @@ static void learn_segment(ge_engine_t *e, const ge_template_t *sample)
         if (e->manual_training) threshold = GE_MAX_THRESHOLD;
         else status = GE_ERR_INCONSISTENT;
     }
+    /* Compression must not erase the acceptance allowance established by an
+     * earlier valid variation, even after that sample is merged into a cluster. */
+    if (e->manual_training) threshold = ge_max(threshold, e->pending_threshold);
     for (i = 0u; i < e->class_limit && status == GE_OK; ++i) {
         const ge_class_t *c = &e->model.classes[i];
         if (!c->used) continue;
@@ -373,7 +436,7 @@ static void learn_segment(ge_engine_t *e, const ge_template_t *sample)
             float limit = 1.5f * ge_max(c->threshold, threshold) + 0.02f;
             float distance = distance_between(e, sample, &c->templates[j]);
             uint8_t pending;
-            for (pending = 0u; pending < e->training_count; ++pending)
+            for (pending = 0u; pending < e->pending_count; ++pending)
                 distance = ge_min(distance, distance_between(e, &e->pending[pending], &c->templates[j]));
             if (distance < limit && distance < conflict_distance) {
                 conflict_distance = distance;
@@ -388,7 +451,8 @@ static void learn_segment(ge_engine_t *e, const ge_template_t *sample)
         emit(e, GE_EVENT_DEMO_REJECTED, status, GE_CLASS_NONE, sample->duration_ms, worst, 0.0f);
         return;
     }
-    e->pending[e->training_count++] = *sample;
+    select_pending(e, sample);
+    ++e->training_count;
     e->pending_threshold = threshold;
     emit(e, GE_EVENT_DEMO_ACCEPTED, GE_OK, GE_CLASS_NONE, sample->duration_ms, worst, 0.0f);
     if (conflict_id != GE_CLASS_NONE)
@@ -468,9 +532,60 @@ static int stream_template(ge_engine_t *e, ge_template_t *sample, uint16_t count
     return 1;
 }
 
-/* One class/scale per feed bounds foreground work to three existing DTWs.
- * The cycle freezes its window endpoint; 64 reserved ring slots protect that
- * history during two 8 * 3 scans. No motion-end decision is needed. */
+static int stream_action_allowed(const ge_engine_t *e, uint8_t id)
+{
+    uint32_t samples;
+    if (id == GE_CLASS_NONE) return 0;
+    if (!(e->stream_accepted_mask & (uint8_t)(1u << id))) return 1;
+    samples = e->stream_duration / 5u;
+    /* Reusing the previous occurrence's samples must never create another
+     * action. Permit only 50 ms of edge jitter in the new complete window.
+     * Each class has its own boundary, so a different complete class can be
+     * found within uninterrupted movement or while another class is ongoing. */
+    return e->stream_endpoint - e->stream_accepted_end[id] + 10u >= samples;
+}
+
+/* Cheap phase-aligned costs only prioritize discovery scales. They never
+ * authorize an event: two complete DTW competitor sweeps must confirm it. */
+static float stream_scale_cost(const ge_template_t *sample, const ge_class_t *c)
+{
+    uint8_t t;
+    uint16_t p, k;
+    float best = FLT_MAX, second = FLT_MAX;
+    for (t = 0u; t < c->template_count; ++t) {
+        float cost = 0.0f;
+        for (p = 0u; p < GE_POINTS; ++p) {
+            for (k = 0u; k < GE_FEATURES; ++k) {
+                float d = ((float)sample->values[p][k] - c->templates[t].values[p][k]) / GE_SCALE;
+                cost += d * d;
+            }
+        }
+        if (cost < best) { second = best; best = cost; }
+        else if (cost < second) second = cost;
+    }
+    return second == FLT_MAX ? sqrtf(best) : sqrtf(best) + sqrtf(second);
+}
+
+static void stream_begin_verify(ge_engine_t *e, uint8_t stage, uint8_t id)
+{
+    e->stream_candidate = id;
+    e->stream_verify = stage;
+    e->stream_cycle = 1u;
+    if (stage == 2u) {
+        e->stream_end = (uint16_t)((e->stream_end + 1u) % GE_STREAM_SAMPLES);
+        ++e->stream_endpoint;
+        if (e->stream_available < GE_STREAM_SAMPLES - GE_STREAM_RESERVE) ++e->stream_available;
+    }
+    e->stream_class = e->stream_scale = 0u;
+    e->stream_best = e->stream_second = e->stream_class_best = FLT_MAX;
+    e->stream_id = GE_CLASS_NONE;
+}
+
+/* Discovery runs one class per feed after cheaply ranking all three scales.
+ * At eight classes the search endpoints are 40 ms apart, avoiding missing a
+ * fast embedded gesture between old 120 ms sweeps. Confirmation still tests
+ * every class at every scale twice, at nearby frozen endpoints. At most three
+ * DTWs run per feed; 64 ring slots protect 8 discovery + 48 verify feeds. */
 static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapsed, int low)
 {
     static const float scales[] = { 0.65f, 1.0f, 1.5f };
@@ -481,6 +596,7 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
     uint32_t duration = 0u;
     if (!e->recognizing || !ge_active_class_count(e)) return;
     memcpy(e->stream_samples[e->stream_head], feature, sizeof(e->stream_samples[0]));
+    ++e->stream_total;
     e->stream_head = (uint16_t)((e->stream_head + 1u) % GE_STREAM_SAMPLES);
     if (e->stream_count < GE_STREAM_SAMPLES - GE_STREAM_RESERVE) ++e->stream_count;
     if (low) {
@@ -508,6 +624,7 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
         if (e->last_ms - e->stream_cycle_ms < GE_STREAM_INTERVAL_MS) return;
         e->stream_cycle_ms = e->last_ms;
         e->stream_end = e->stream_head;
+        e->stream_endpoint = e->stream_total;
         e->stream_available = e->stream_count;
         e->stream_class = e->stream_scale = 0u;
         e->stream_best = e->stream_second = e->stream_class_best = FLT_MAX;
@@ -520,6 +637,19 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
         c = &e->model.classes[e->stream_class];
         for (i = 0u; i < c->template_count; ++i) duration += c->templates[i].duration_ms;
         duration /= c->template_count;
+        if (!e->stream_verify) {
+            float best_cost = FLT_MAX;
+            uint8_t best_scale = 0u;
+            for (i = 0u; i < 3u; ++i) {
+                float cost;
+                count = (uint16_t)((float)duration * scales[i] / 5.0f + 0.5f);
+                if (count > GE_STREAM_SAMPLES - GE_STREAM_RESERVE) count = GE_STREAM_SAMPLES - GE_STREAM_RESERVE;
+                if (!stream_template(e, &sample, count)) continue;
+                cost = stream_scale_cost(&sample, c);
+                if (cost < best_cost) { best_cost = cost; best_scale = i; }
+            }
+            e->stream_scale = best_scale;
+        }
         count = (uint16_t)((float)duration * scales[e->stream_scale] / 5.0f + 0.5f);
         if (count > GE_STREAM_SAMPLES - GE_STREAM_RESERVE) count = GE_STREAM_SAMPLES - GE_STREAM_RESERVE;
         if (stream_template(e, &sample, count)) {
@@ -529,6 +659,7 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
                 e->stream_class_duration = sample.duration_ms;
             }
         }
+        if (!e->stream_verify) e->stream_scale = 2u;
         if (++e->stream_scale < 3u) return;
         if (e->stream_class_best < e->stream_best) {
             e->stream_second = e->stream_best;
@@ -546,31 +677,34 @@ static void stream_match(ge_engine_t *e, const int16_t *feature, uint32_t elapse
     e->stream_cycle = 0u;
     id = e->stream_id;
     if (id == GE_CLASS_NONE || e->stream_best > e->model.classes[id].threshold ||
-        (e->stream_second != FLT_MAX &&
+        (e->stream_verify && e->stream_second != FLT_MAX &&
          (e->stream_second - e->stream_best < 0.025f || e->stream_best > e->stream_second * 0.78f)))
         id = GE_CLASS_NONE;
+    if (!e->stream_verify) {
+        /* Discovery runner-ups may have ranked another scale first. Only the
+         * complete frozen sweep can decide ambiguity or expose a better class. */
+        if (stream_action_allowed(e, id)) stream_begin_verify(e, 1u, id);
+        else emit(e, GE_EVENT_MATCH, GE_OK, GE_CLASS_NONE, e->stream_duration, e->stream_best, e->stream_second);
+        return;
+    }
     emit(e, GE_EVENT_MATCH, GE_OK, id, e->stream_duration, e->stream_best, e->stream_second);
-    if (e->stream_verify) {
+    if (e->stream_verify == 2u) {
         e->stream_verify = 0u;
-        if (id != GE_CLASS_NONE && id == e->stream_candidate && !e->stream_latched) {
+        if (id != GE_CLASS_NONE && id == e->stream_candidate && stream_action_allowed(e, id)) {
             e->stream_latched = 1u;
+            e->stream_accepted_mask |= (uint8_t)(1u << id);
+            e->stream_accepted_end[id] = e->stream_endpoint;
             emit(e, GE_EVENT_RECOGNIZED, GE_OK, id, e->stream_duration, e->stream_best, e->stream_second);
         }
         e->stream_candidate = id;
         return;
     }
-    e->stream_candidate = id;
     /* Rescan every competitor at a nearby frozen endpoint. Waiting for a new
      * moving window can skip a fast gesture at eight-class capacity; freezing
      * both endpoints preserves that evidence without using stale runner-ups. */
-    if (id != GE_CLASS_NONE && !e->stream_latched) {
-        e->stream_verify = e->stream_cycle = 1u;
-        e->stream_end = (uint16_t)((e->stream_end + 1u) % GE_STREAM_SAMPLES);
-        if (e->stream_available < GE_STREAM_SAMPLES - GE_STREAM_RESERVE) ++e->stream_available;
-        e->stream_class = e->stream_scale = 0u;
-        e->stream_best = e->stream_second = e->stream_class_best = FLT_MAX;
-        e->stream_id = GE_CLASS_NONE;
-    }
+    if (stream_action_allowed(e, id)) {
+        stream_begin_verify(e, 2u, id);
+    } else { e->stream_verify = 0u; e->stream_candidate = id; }
 }
 
 static void finish_segment(ge_engine_t *e, uint32_t duration, int trim)
@@ -613,7 +747,7 @@ static void finish_segment(ge_engine_t *e, uint32_t duration, int trim)
      * each sensor group's envelope; keep a floor so near-zero noise stays small. */
     normalize_template(&sample);
     emit(e, GE_EVENT_SEGMENT_FINISHED, GE_OK, GE_CLASS_NONE, sample.duration_ms, 0.0f, 0.0f);
-    if (e->training && e->training_count < GE_TEMPLATES_PER_CLASS) learn_segment(e, &sample);
+    if (e->training && e->training_count < GE_MAX_TRAINING_DEMOS) learn_segment(e, &sample);
     else if (!e->training && e->recognizing) recognize_segment(e, &sample);
 }
 

@@ -103,7 +103,11 @@ def parse_line(line):
     elif kind == "CONFIG":
         if len(fields) != 3:
             raise ValueError("CONFIG requires class limit and demonstration target")
-        record.update(class_limit=integer(fields[1], 1, 8), demo_target=integer(fields[2], 1, 3))
+        record.update(class_limit=integer(fields[1], 1, 8), demo_target=integer(fields[2], 1, 20))
+    elif kind == "DEMOLIMIT":
+        if len(fields) != 2:
+            raise ValueError("DEMOLIMIT requires maximum demonstration count")
+        record["demo_limit"] = integer(fields[1], 1, 20)
     elif kind == "TIMING":
         if len(fields) != 2:
             raise ValueError("TIMING requires RGB hold duration")

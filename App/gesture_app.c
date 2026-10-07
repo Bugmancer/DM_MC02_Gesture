@@ -44,7 +44,7 @@ static void show_match_rgb(uint8_t slot, uint32_t now, uint32_t hold_ms)
 
 static void report_firmware(void)
 {
-    gesture_usb_log(0, "FIRMWARE,gesture-20261006-r9,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,SIMILARITY_WARNING,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG,RGB_TIMING\r\n");
+    gesture_usb_log(0, "FIRMWARE,gesture-20261007-r10,KEY_CAPTURE,NO_CALIBRATION,RANDOM_START,LIVE_MATCH,ONE_DEMO,RAW_KEY,AUTO_RECOGNITION,DEVICE_CONFIG,GUI_CONFIG,RGB_TIMING,MORE_DEMOS\r\n");
 }
 
 static void report_capture(void)
@@ -265,7 +265,7 @@ static void save_model(void)
     memset(candidate, 0, sizeof(*candidate));
     if (!deleting) {
         candidate->used = 1u;
-        candidate->template_count = ge_training_progress(&engine);
+        candidate->template_count = engine.pending_count;
         candidate->threshold = engine.pending_threshold;
         memcpy(candidate->name, engine.pending_name, sizeof(candidate->name));
         memcpy(candidate->templates, engine.pending, sizeof(candidate->templates));
@@ -312,6 +312,7 @@ static void report_config(void)
             "COLOR,%u,%06lX\r\n", slot + 1u, (unsigned long)config.colors[slot]);
     gesture_usb_log(0, "%s", lines);
     gesture_usb_log(0, "TIMING,%u\r\n", (unsigned)config.rgb_hold_ms);
+    gesture_usb_log(0, "DEMOLIMIT,%u\r\n", (unsigned)GE_MAX_TRAINING_DEMOS);
 }
 
 static void settings_begin(void)
@@ -377,7 +378,7 @@ static void configure_command(const char *line)
         &limit, &demos, colors[0], colors[1], colors[2], colors[3],
         colors[4], colors[5], colors[6], colors[7], &consumed);
     if (parsed != 10 || limit < 1u || limit > GE_MAX_CLASSES ||
-        demos < 1u || demos > GE_TEMPLATES_PER_CLASS) goto invalid;
+        demos < 1u || demos > GE_MAX_TRAINING_DEMOS) goto invalid;
     candidate = config;
     candidate.class_limit = (uint8_t)limit;
     candidate.demo_target = (uint8_t)demos;
@@ -432,7 +433,7 @@ static void settings_key(BoardKey key)
         if (settings_row == 0u) value = &config_draft.class_limit;
         if (settings_row == 1u) value = &config_draft.demo_target;
         if (value) {
-            unsigned maximum = settings_row ? GE_TEMPLATES_PER_CLASS : GE_MAX_CLASSES;
+            unsigned maximum = settings_row ? GE_MAX_TRAINING_DEMOS : GE_MAX_CLASSES;
             if (direction > 0 && *value < maximum) ++*value;
             if (direction < 0 && *value > 1u) --*value;
             if (settings_slot >= config_draft.class_limit) settings_slot = (uint8_t)(config_draft.class_limit - 1u);

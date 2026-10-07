@@ -714,7 +714,11 @@ static void test_manual_training_then_automatic_recognition(void)
         }
     }
     assert(ready == 1u && accepted == 3u && ge_training_ready(&imported));
-    assert(ge_train_capture_begin(&imported, timestamp) == GE_ERR_NOT_READY);
+    assert(ge_train_capture_begin(&imported, timestamp) == GE_OK);
+    motion_samples(&imported, 0, 750u, 1.0f, 0);
+    assert(ge_train_capture_end(&imported, timestamp) == GE_OK);
+    events(&imported);
+    assert(ge_training_progress(&imported) == 4u && imported.pending_count == 3u);
     assert(ge_train_confirm(&imported, &saved) == GE_OK && saved == 2u);
     length = ge_model_export(&imported, blob, sizeof(blob));
     assert(length > 0u);
@@ -1005,8 +1009,8 @@ static void test_live_matching(void)
     idle(&imported, 500u, 0);
     assert(recognized == 0u && matched == 0u);
 
-    /* Two different complete classes can change preview without action repeats
-     * during the same uninterrupted motion bout. */
+    /* Each complete gesture can trigger without a quiet gap; overlapping
+     * windows of one occurrence cannot create repeated actions. */
     ge_reset_stream(&imported);
     assert(ge_train_begin_at(&imported, 5u, "YAW ONE") == GE_OK);
     assert(ge_train_capture_begin(&imported, timestamp) == GE_OK);
@@ -1017,13 +1021,19 @@ static void test_live_matching(void)
     clear_events();
     motion_samples(&imported, 0, 700u, 1.0f, 0);
     assert(matched > 0u && recognized == 1u && last_class == 2u);
-    for (i = 0u; i < 3u; ++i) motion_samples(&imported, 1, 700u, 1.0f, 0);
-    assert(recognized == 1u && last_preview == 5u);
+    for (i = 0u; i < 3u; ++i) {
+        motion_samples(&imported, 1, 700u, 1.0f, 0);
+        printf("Live continuous repeat %u: actions=%u class=%u\n", i + 1u, recognized, last_class);
+        assert(recognized == i + 2u && last_class == 5u);
+    }
+    /* Discovery suppresses reused windows while looking for a new occurrence;
+     * its preview may already be clear after the confirmed action. */
+    assert(last_preview == 5u || last_preview == GE_CLASS_NONE);
     idle(&imported, 500u, 0);
     assert(last_preview == GE_CLASS_NONE);
     motion(&imported, 1, 700u, 1.0f, 0);
-    assert(recognized == 2u && last_class == 5u);
-    puts("Live matching: arbitrary holding poses, one-take save, speed, prefix/weak rejection and action latch passed.");
+    assert(recognized == 5u && last_class == 5u);
+    puts("Live matching: arbitrary holding poses, one-take save, speed, prefix/weak rejection and continuous complete actions passed.");
 }
 
 static void test_live_twenty_minute_stream(void)
@@ -1167,6 +1177,207 @@ static void test_class_limit_preserves_hidden_slots(void)
     puts("Class limits preserve stored slots and mask learning, warnings and both matchers.");
 }
 
+static void test_twenty_demonstrations_compact_model(void)
+{
+    static const float variants[] = { 0.65f, 0.85f, 1.0f, 1.15f };
+    static const unsigned speeds[] = { 450u, 700u, 1150u };
+    ge_template_t first_three[GE_TEMPLATES_PER_CLASS];
+    uint8_t saved;
+    unsigned i, j, support;
+    float previous_threshold = 0.0f;
+    size_t length;
+    prepare_manual(&imported);
+    for (i = 0u; i < GE_MAX_TRAINING_DEMOS; ++i) {
+        float variation = i < GE_TEMPLATES_PER_CLASS ? 1.0f : variants[i % 4u];
+        unsigned duration = i < GE_TEMPLATES_PER_CLASS ? 700u : 600u + 50u * (i % 5u);
+        assert(ge_train_capture_begin(&imported, timestamp) == GE_OK);
+        variant_motion_samples(&imported, duration, variation);
+        assert(ge_train_capture_end(&imported, timestamp) == GE_OK);
+        events(&imported);
+        assert(ge_training_progress(&imported) == i + 1u);
+        assert(imported.pending_count == (i < 3u ? i + 1u : 3u));
+        assert(imported.pending_threshold >= previous_threshold && imported.pending_threshold <= 0.180f);
+        previous_threshold = imported.pending_threshold;
+        support = 0u;
+        for (j = 0u; j < imported.pending_count; ++j) support += imported.pending_support[j];
+        assert(support == i + 1u);
+        if (i + 1u == GE_TEMPLATES_PER_CLASS) memcpy(first_three, imported.pending, sizeof(first_three));
+        if (i == 8u) {
+            ge_template_t before[GE_TEMPLATES_PER_CLASS];
+            memcpy(before, imported.pending, sizeof(before));
+            assert(ge_train_capture_begin(&imported, timestamp) == GE_OK);
+            motion_samples(&imported, 2, 700u, 1.0f, 0);
+            assert(ge_train_capture_end(&imported, timestamp) == GE_ERR_INCONSISTENT);
+            events(&imported);
+            assert(ge_training_progress(&imported) == i + 1u);
+            assert(!memcmp(before, imported.pending, sizeof(before)));
+        }
+    }
+    assert(accepted == GE_MAX_TRAINING_DEMOS && rejected == 1u && ready == 1u);
+    assert(memcmp(first_three, imported.pending, sizeof(first_three)) != 0);
+    assert(ge_train_capture_begin(&imported, timestamp) == GE_ERR_NOT_READY);
+    assert(ge_train_confirm(&imported, &saved) == GE_OK && saved == 2u);
+    assert(imported.model.classes[2].template_count == GE_TEMPLATES_PER_CLASS);
+    length = ge_model_export(&imported, snapshot, sizeof(snapshot));
+    assert(length == 14128u && ge_model_import(&imported, snapshot, length) == GE_OK);
+    assert(ge_model_export(&imported, blob, sizeof(blob)) == length && !memcmp(snapshot, blob, length));
+    ge_set_streaming_recognition(&imported, 1);
+    for (i = 0u; i < 4u; ++i) {
+        for (j = 0u; j < 3u; ++j) {
+            ge_reset_stream(&imported);
+            idle(&imported, 300u, 0);
+            clear_events();
+            variant_motion_samples(&imported, speeds[j], variants[i]);
+            idle(&imported, 400u, 0);
+            printf("Twenty-demo compressed model variation=%u speed=%u: actions=%u distance=%.6f\n",
+                   i, speeds[j], recognized, last_recognition_distance);
+            assert(recognized == 1u && last_class == 2u);
+        }
+    }
+    ge_reset_stream(&imported);
+    idle(&imported, 300u, 0);
+    clear_events();
+    motion(&imported, 1, 700u, 1.0f, 0);
+    motion(&imported, 2, 700u, 1.0f, 0);
+    motion(&imported, 3, 700u, 1.0f, 0);
+    motion(&imported, 0, 700u, 0.4f, 0);
+    assert(recognized == 0u && matched == 0u && unknown == 4u);
+    puts("Twenty demonstrations: bounded representatives, support accounting, variation/speed retention, unchanged GDT1 format.");
+}
+
+static void half_motion_samples(ge_engine_t *e, int kind, unsigned duration, int tail, int tilt)
+{
+    unsigned i, count = duration / 5u;
+    unsigned first = tail ? count / 2u : 0u, last = tail ? count : count / 2u;
+    for (i = first; i < last; ++i) {
+        float wave = sinf(2.0f * PI_F * (float)i / (float)(count - 1u));
+        feed(e, 0.0f, 0.0f, GRAVITY + (kind == 0 ? 4.5f * wave : 0.0f),
+             0.0f, 0.0f, kind == 1 ? 3.0f * wave : 0.0f, tilt);
+    }
+}
+
+static void test_live_nested_complete_gestures(void)
+{
+    static const unsigned durations[] = { 450u, 700u, 1150u };
+    uint8_t saved;
+    unsigned i, speed, before, t, p, k, offset;
+    ge_init(&imported);
+    ge_set_manual_training(&imported, 1);
+    ge_set_streaming_recognition(&imported, 1);
+    idle(&imported, 300u, 0);
+    for (i = 0u; i < 2u; ++i) {
+        assert(ge_train_begin_at(&imported, (uint8_t)i, i ? "NESTED B" : "OUTER A") == GE_OK);
+        assert(ge_train_capture_begin(&imported, timestamp) == GE_OK);
+        motion_samples(&imported, (int)i, 700u, 1.0f, 0);
+        assert(ge_train_capture_end(&imported, timestamp) == GE_OK);
+        assert(ge_train_confirm(&imported, &saved) == GE_OK && saved == i);
+    }
+    for (i = 0u; i < 4u; ++i) {
+        for (speed = 0u; speed < 3u; ++speed) {
+            ge_reset_stream(&imported);
+            idle(&imported, 300u, (int)i);
+            clear_events();
+            half_motion_samples(&imported, 0, 700u, 0, (int)i);
+            assert(recognized == 0u);
+            motion_samples(&imported, 1, durations[speed], 1.0f, (int)i);
+            half_motion_samples(&imported, 0, 700u, 1, (int)i);
+            printf("Nested half A / B / half A pose=%u B=%ums: actions=%u class=%u\n",
+                   i, durations[speed], recognized, last_class);
+            assert(recognized == 1u && last_class == 1u);
+            idle(&imported, 500u, (int)i);
+            assert(recognized == 1u);
+        }
+        ge_reset_stream(&imported);
+        idle(&imported, 300u, (int)i);
+        clear_events();
+        motion_samples(&imported, 0, 700u, 1.0f, (int)i);
+        assert(recognized == 1u && last_class == 0u);
+        motion_samples(&imported, 1, 700u, 1.0f, (int)i);
+        assert(recognized == 2u && last_class == 1u);
+        motion_samples(&imported, 0, 700u, 1.0f, (int)i);
+        assert(recognized == 3u && last_class == 0u);
+        before = recognized;
+        idle(&imported, 300u, (int)i);
+        assert(recognized == before); /* Shifted trailing windows cannot retrigger. */
+    }
+    /* Frozen scan endpoints and per-class boundaries also survive timestamp
+     * rollover and the maximum competitor scan cost. */
+    for (i = 2u; i < GE_MAX_CLASSES; ++i) {
+        ge_class_t *c = &imported.model.classes[i];
+        *c = imported.model.classes[1];
+        c->template_count = GE_TEMPLATES_PER_CLASS;
+        for (t = 0u; t < GE_TEMPLATES_PER_CLASS; ++t) {
+            c->templates[t].duration_ms = 700u;
+            for (p = 0u; p < GE_POINTS; ++p)
+                for (k = 0u; k < GE_FEATURES; ++k)
+                    c->templates[t].values[p][k] = (int16_t)(2000u + i * 400u + t * 100u);
+        }
+    }
+    for (i = 0u; i < 2u; ++i) {
+        imported.model.classes[i].template_count = GE_TEMPLATES_PER_CLASS;
+        for (t = 1u; t < GE_TEMPLATES_PER_CLASS; ++t)
+            imported.model.classes[i].templates[t] = imported.model.classes[i].templates[0];
+    }
+    for (i = 0u; i < 4u; ++i) {
+        for (speed = 0u; speed < 3u; ++speed) {
+            for (offset = 0u; offset < 8u; ++offset) {
+                timestamp = UINT32_MAX - 450u;
+                ge_reset_stream(&imported);
+                idle(&imported, 300u + offset * 5u, (int)i);
+                clear_events();
+                half_motion_samples(&imported, 0, 700u, 0, (int)i);
+                motion_samples(&imported, 1, durations[speed], 1.0f, (int)i);
+                half_motion_samples(&imported, 0, 700u, 1, (int)i);
+                if (recognized != 1u || last_class != 1u)
+                    printf("Eight-class nested failure pose=%u speed=%u phase=%u actions=%u class=%u\n",
+                           i, durations[speed], offset, recognized, last_class);
+                assert(recognized == 1u && last_class == 1u);
+                idle(&imported, 500u, (int)i);
+                assert(recognized == 1u);
+            }
+            ge_reset_stream(&imported);
+            idle(&imported, 300u, (int)i);
+            clear_events();
+            half_motion_samples(&imported, 0, 700u, 0, (int)i);
+            motion_samples(&imported, 1, durations[speed], 1.0f, (int)i);
+            motion_samples(&imported, 2, 300u, 1.0f, (int)i);
+            assert(recognized == 1u && last_class == 1u);
+            idle(&imported, 500u, (int)i);
+            assert(recognized == 1u);
+        }
+        for (offset = 0u; offset < 8u; ++offset) {
+            ge_reset_stream(&imported);
+            idle(&imported, 300u + offset * 5u, (int)i);
+            clear_events();
+            motion_samples(&imported, 0, 450u, 1.0f, (int)i);
+            motion_samples(&imported, 0, 450u, 1.0f, (int)i);
+            motion_samples(&imported, 2, 700u, 1.0f, (int)i);
+            assert(recognized == 2u && last_class == 0u);
+            idle(&imported, 500u, (int)i);
+            assert(recognized == 2u);
+        }
+    }
+    ge_reset_stream(&imported);
+    idle(&imported, 300u, 3);
+    clear_events();
+    motion(&imported, 2, 900u, 1.0f, 3);
+    assert(recognized == 0u && matched == 0u && unknown == 1u);
+    /* A nearby competitor must not become a second action from the same
+     * samples; both full verification passes enforce the ambiguity margin. */
+    imported.model.classes[7] = imported.model.classes[0];
+    for (t = 0u; t < GE_TEMPLATES_PER_CLASS; ++t)
+        for (p = 0u; p < GE_POINTS; ++p)
+            for (k = 0u; k < GE_FEATURES; ++k)
+                imported.model.classes[7].templates[t].values[p][k] =
+                    (int16_t)((float)imported.model.classes[7].templates[t].values[p][k] * 0.98f);
+    ge_reset_stream(&imported);
+    idle(&imported, 300u, 0);
+    clear_events();
+    motion(&imported, 0, 700u, 1.0f, 0);
+    assert(recognized == 0u && matched == 0u && unknown == 1u);
+    puts("Nested continuous recognition: complete inner B, partial A rejection, A/B/A, arbitrary poses, three speeds and eight-slot rollover.");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -1188,6 +1399,8 @@ int main(void)
     test_live_twenty_minute_stream();
     test_live_prehistory_and_full_capacity();
     test_class_limit_preserves_hidden_slots();
+    test_twenty_demonstrations_compact_model();
+    test_live_nested_complete_gestures();
     puts("All gesture engine tests passed.");
     return 0;
 }

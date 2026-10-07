@@ -135,7 +135,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.snapshot()["config_write"]["state"], "failed")
         with self.assertRaisesRegex(ValueError, "r9"):
             self.controller.configure_board({**payload, "rgb_hold_ms": 5000})
-        for update in ({"class_limit": 9}, {"demo_target": 0}, {"colors": ["#xxxxxx"] * 8}, {"colors": []}):
+        for update in ({"class_limit": 9}, {"demo_target": 0}, {"demo_target": 21}, {"colors": ["#xxxxxx"] * 8}, {"colors": []}):
             with self.assertRaises(ValueError):
                 self.controller.configure_board({**payload, **update})
 
@@ -159,6 +159,33 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(self.controller.snapshot()["config"]["rgb_hold_ms"], 30000)
         self.assertEqual(self.controller.snapshot()["config_write"]["state"], "saved")
 
+    def test_more_demos_requires_capability_and_uses_reported_limit(self):
+        self.connect_real()
+        payload = {"class_limit": 8, "demo_target": 20, "colors": ["#123456"] * 8,
+                   "rgb_hold_ms": 30000}
+        self.controller._process_line("FIRMWARE,gesture-20261006-r9,AUTO_RECOGNITION,GUI_CONFIG,RGB_TIMING")
+        with self.assertRaisesRegex(ValueError, "r10"):
+            self.controller.configure_board(payload)
+        self.controller._process_line("FIRMWARE,gesture-20261007-r10,KEY_CAPTURE,AUTO_RECOGNITION,GUI_CONFIG,RGB_TIMING,MORE_DEMOS")
+        self.controller._process_line("DEMOLIMIT,20")
+        self.controller.configure_board(payload)
+        until(lambda: any(data.startswith(b"configure 8 20 ") for data in self.serial.writes))
+        wire = next(data for data in self.serial.writes if data.startswith(b"configure "))
+        self.assertLess(len(wire), 80, "Maximum count and duration fit the board command buffer")
+        self.controller._process_line("CONFIG,8,20")
+        self.controller._process_line("CONFIG_RESULT,SAVED")
+        self.controller._process_line("TRAIN,BEGIN,3")
+        self.controller._process_line("TRAIN,DEMO,3,19")
+        self.controller._process_line("INFO,1,7,1,1,3,19,0,0")
+        self.assertEqual(self.controller.snapshot()["training"]["collected"], 19)
+        self.assertEqual(self.controller.snapshot()["training"]["required"], 20)
+        self.controller._process_line("TRAIN,READY,3")
+        self.assertEqual(self.controller.snapshot()["training"]["collected"], 20)
+        self.controller._process_line("STATE,IDLE")
+        self.controller._process_line("DEMOLIMIT,10")
+        with self.assertRaisesRegex(ValueError, "10"):
+            self.controller.configure_board(payload)
+
     def test_demo_config_writes_change_live_state_and_disable_high_slots(self):
         self.controller.connect(demo=True)
         until(lambda: self.controller.snapshot()["protocol"]["inventory"])
@@ -181,7 +208,7 @@ class ControllerTests(unittest.TestCase):
         self.controller._process_line("COLOR,1,18000A")
         self.controller._process_line("SLOT,3,2,Preserved")
         state = self.controller.snapshot()
-        self.assertEqual(state["config"], {"class_limit": 2, "demo_target": 3, "reported": True,
+        self.assertEqual(state["config"], {"class_limit": 2, "demo_target": 3, "demo_limit": 3, "reported": True,
                                            "rgb_hold_ms": 3000, "timing_reported": False})
         self.assertEqual(state["training"]["required"], 3, "CONFIG target overrides compatibility ONE_DEMO")
         self.assertEqual(state["slots"][0]["color"], "#18000a")
@@ -584,6 +611,29 @@ class ControllerTests(unittest.TestCase):
         self.controller.command("demo key 0")
         until(lambda: self.controller.snapshot()["slots"][2]["state"] == "saved")
         self.assertEqual(self.controller.snapshot()["slots"][2]["templates"], 1)
+        self.assertEqual(self.controller.snapshot()["status"]["armed"], 1)
+
+    def test_demo_many_demonstrations_save_only_at_target_with_three_templates(self):
+        self.controller.connect(demo=True)
+        until(lambda: self.controller.snapshot()["protocol"]["inventory"])
+        self.controller.configure_board({"class_limit": 8, "demo_target": 6, "colors": ["#123456"] * 8})
+        until(lambda: self.controller.snapshot()["config_write"]["state"] == "saved")
+        self.controller.command("learn 3")
+        until(lambda: self.controller.snapshot()["training"]["state"] == "recording")
+        for count in range(1, 7):
+            self.controller.command("demo key 1")
+            until(lambda: self.controller.snapshot()["training"]["capturing"])
+            with self.controller._lock:
+                self.controller._demo_key_started = time.monotonic() - 0.7
+            self.controller.command("demo key 0")
+            if count < 6:
+                until(lambda: self.controller.snapshot()["training"]["collected"] == count)
+                self.assertEqual(self.controller.snapshot()["training"]["required"], 6)
+                self.assertEqual(self.controller.snapshot()["slots"][2]["state"], "empty")
+                self.assertEqual(self.controller.snapshot()["status"]["armed"], 0)
+        until(lambda: self.controller.snapshot()["slots"][2]["state"] == "saved")
+        self.assertEqual(self.controller.snapshot()["slots"][2]["templates"], 3)
+        self.assertEqual(self.controller.snapshot()["training"]["state"], "idle")
         self.assertEqual(self.controller.snapshot()["status"]["armed"], 1)
 
     def test_demo_rejects_overlong_hold_only_after_release(self):

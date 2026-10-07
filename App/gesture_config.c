@@ -61,7 +61,7 @@ ge_status_t gc_validate(const gesture_config_t *config)
 {
     uint8_t id;
     if (!config || config->class_limit == 0u || config->class_limit > GE_MAX_CLASSES ||
-        config->demo_target == 0u || config->demo_target > GE_TEMPLATES_PER_CLASS ||
+        config->demo_target == 0u || config->demo_target > GE_MAX_TRAINING_DEMOS ||
         config->rgb_hold_ms < GC_RGB_HOLD_MIN_MS ||
         config->rgb_hold_ms > GC_RGB_HOLD_MAX_MS ||
         config->rgb_hold_ms % GC_RGB_HOLD_STEP_MS != 0u)
